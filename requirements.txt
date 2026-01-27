@@ -1,0 +1,23 @@
+# DRE Guardian - Python Dependencies
+# Install: pip install -r requirements.txt
+
+# Core data processing
+openpyxl==3.1.2          # Excel file reading/writing
+numpy==1.26.3            # Numerical computation
+scipy==1.11.4            # Statistical functions (PERT overlap)
+
+# Schema validation
+pydantic==2.5.3          # Type validation for manifest.json
+
+# API & Server
+fastapi==0.109.0         # REST API server
+uvicorn==0.25.0          # ASGI server
+python-multipart==0.0.6  # Form data parsing
+websockets==12.0         # WebSocket support
+
+# File monitoring
+watchdog==3.0.0          # File system event watcher
+
+# CLI & Terminal UI
+click==8.1.7             # CLI framework
+rich==13.7.0             # Beautiful terminal output

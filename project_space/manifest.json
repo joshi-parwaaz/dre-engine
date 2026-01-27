@@ -1,0 +1,40 @@
+{
+  "project_id": "validation-test-2026",
+  "target_file": "test_model.xlsx",
+  "stability_threshold": 0.15,
+  "overlap_integral_cutoff": 0.05,
+  "assertions": [
+    {
+      "id": "ast-001",
+      "logical_name": "raw_material_cost",
+      "owner_role": "Director of Supply Chain",
+      "last_updated": "2026-01-26T09:00:00Z",
+      "sla_days": 15,
+      "binding": {
+        "cell": "B5"
+      },
+      "baseline_value": 450.0,
+      "distribution": {
+        "min": 420.0,
+        "mode": 450.0,
+        "max": 600.0
+      }
+    },
+    {
+      "id": "ast-002",
+      "logical_name": "market_capture_rate",
+      "owner_role": "VP of Sales",
+      "last_updated": "2026-01-26T14:30:00Z",
+      "sla_days": 7,
+      "binding": {
+        "cell": "C10"
+      },
+      "baseline_value": 0.12,
+      "distribution": {
+        "min": 0.05,
+        "mode": 0.12,
+        "max": 0.15
+      }
+    }
+  ]
+}

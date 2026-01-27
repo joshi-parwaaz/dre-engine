@@ -1,0 +1,50 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Excel temp files
+~$*.xlsx
+.~lock.*
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Dashboard
+dashboard/node_modules/
+dashboard/dist/
+dashboard/.vite/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Project specific
+project_space/*.xlsx
+!project_space/model.xlsx
