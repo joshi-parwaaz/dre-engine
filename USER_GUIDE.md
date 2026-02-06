@@ -140,48 +140,40 @@ Open `project_space/manifest.json` in a text editor (Notepad, VS Code, etc.)
 
 ### Basic Configuration
 
+
 ```json
 {
   "project_id": "q1-2026-forecast",
-  "project_name": "Q1 2026 Revenue Forecast",
   "target_file": "Q1-Forecast.xlsx",
-  
-  "governance_config": {
-    "stability_threshold": 0.15,
-    "overlap_integral_cutoff": 0.05,
-    "freshness_sla_enforcement": true
-  },
-  
+  "stability_threshold": 0.15,
+  "overlap_integral_cutoff": 0.05,
   "assertions": [...]
 }
 ```
 
 **Fields:**
 - `project_id` - Unique identifier (no spaces, use hyphens)
-- `project_name` - Descriptive name
 - `target_file` - **Exact** filename of your Excel file
-- `governance_config` - Sensitivity settings (leave defaults unless advised)
+- `stability_threshold` - (optional) Default: 0.15
+- `overlap_integral_cutoff` - (optional) Default: 0.05
 
 ### Define Assertions
 
 Each assertion monitors one cell. Example:
 
+
 ```json
 {
   "id": "revenue-forecast",
   "logical_name": "q1_revenue",
-  "description": "Q1 2026 Revenue Forecast",
   "owner_role": "VP of Sales",
   "last_updated": "2026-02-01T10:00:00Z",
   "sla_days": 7,
-  
   "binding": {
     "cell": "B2",
     "sheet": "Dashboard"
   },
-  
   "baseline_value": 1000000.0,
-  
   "distribution": {
     "min": 850000.0,
     "mode": 1000000.0,
@@ -669,34 +661,25 @@ After the bypass expires:
 
 ### Complete Template
 
+
 ```json
 {
   "project_id": "your-project-id",
-  "project_name": "Your Project Name",
   "target_file": "your-model.xlsx",
-  
-  "governance_config": {
-    "stability_threshold": 0.15,
-    "overlap_integral_cutoff": 0.05,
-    "freshness_sla_enforcement": true
-  },
-  
+  "stability_threshold": 0.15,
+  "overlap_integral_cutoff": 0.05,
   "assertions": [
     {
       "id": "example-assertion",
       "logical_name": "example_cell",
-      "description": "Example cell description",
       "owner_role": "Role Name",
       "last_updated": "2026-02-01T10:00:00Z",
       "sla_days": 7,
-      
       "binding": {
         "cell": "A1",
         "sheet": "Sheet1"
       },
-      
       "baseline_value": 0.0,
-      
       "distribution": {
         "min": 0.0,
         "mode": 0.0,

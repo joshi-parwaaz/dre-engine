@@ -180,20 +180,15 @@ project_space/
 
 ## Manifest Configuration
 
+
 ### Required Fields
 
 ```json
 {
   "project_id": "unique-identifier",
-  "project_name": "Descriptive Name",
   "target_file": "your-model.xlsx",
-  
-  "governance_config": {
-    "stability_threshold": 0.15,
-    "overlap_integral_cutoff": 0.05,
-    "freshness_sla_enforcement": true
-  },
-  
+  "stability_threshold": 0.15,
+  "overlap_integral_cutoff": 0.05,
   "assertions": [...]
 }
 ```
@@ -206,18 +201,14 @@ Each assertion monitors a specific cell:
 {
   "id": "unique-assertion-id",
   "logical_name": "variable_name",
-  "description": "Human-readable description",
   "owner_role": "Responsible person/role",
   "last_updated": "2026-02-01T10:30:00Z",
   "sla_days": 7,
-  
   "binding": {
     "cell": "B2",
     "sheet": "Dashboard"
   },
-  
   "baseline_value": 1000000.0,
-  
   "distribution": {
     "min": 850000.0,
     "mode": 1000000.0,

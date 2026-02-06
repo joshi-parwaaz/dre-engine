@@ -751,33 +751,38 @@ DRE-Engine-v1.0.zip
 ### Manifest Schema (Pydantic)
 
 ```python
-class DREManifest(BaseModel):
-    project_id: str
-    project_name: str
-    target_file: str
-    governance_config: GovernanceConfig
-    assertions: List[Assertion]
-
-class Assertion(BaseModel):
-    id: str
-    logical_name: str
-    description: str
-    owner_role: str
-    last_updated: str
-    sla_days: int
-    binding: CellBinding
-    baseline_value: float
-    distribution: PERTDistribution
-
-class CellBinding(BaseModel):
-    cell: str
-    sheet: str
-
-class PERTDistribution(BaseModel):
+class PertDistribution(BaseModel):
     min: float
     mode: float
     max: float
+    # Validator enforces: min <= mode <= max
+
+class DataBinding(BaseModel):
+    cell: str
+    sheet: Optional[str] = None  # Defaults to active sheet
+    named_range: Optional[str] = None
+    formula_hash: Optional[str] = None
+
+class Assertion(BaseModel):
+    id: str                      # Stable UUID for tracking
+    logical_name: str
+    binding: DataBinding
+    owner_role: str              # Accountable stakeholder
+    last_updated: datetime       # ISO 8601 timestamp
+    sla_days: int
+    baseline_value: Optional[float] = None
+    distribution: PertDistribution
+
+class DREManifest(BaseModel):
+    project_id: str
+    target_file: str
+    stability_threshold: float = 0.15          # Gate 2 threshold
+    overlap_integral_cutoff: float = 0.05      # Gate 3 cutoff
+    assertions: List[Assertion]
+    conflict_pairs: Optional[List[Tuple[str, str]]] = None  # For Gate 3
 ```
+
+**Note:** The manifest.json file may contain additional display fields like `project_name`, `description`, and `governance_config` that are used by the validator and dashboard but are not part of the core Pydantic schema.
 
 ### FastAPI Endpoints
 

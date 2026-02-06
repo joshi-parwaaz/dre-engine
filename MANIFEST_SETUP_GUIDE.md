@@ -19,15 +19,9 @@ This guide explains how to configure `manifest.json` to define your governance r
 ```json
 {
   "project_id": "my-project",
-  "project_name": "My Strategic Model",
   "target_file": "model.xlsx",
-  
-  "governance_config": {
-    "stability_threshold": 0.15,
-    "overlap_integral_cutoff": 0.05,
-    "freshness_sla_enforcement": true
-  },
-  
+  "stability_threshold": 0.15,
+  "overlap_integral_cutoff": 0.05,
   "assertions": [
     { ... }
   ]
@@ -39,18 +33,14 @@ This guide explains how to configure `manifest.json` to define your governance r
 | Field | Required | Description |
 |-------|----------|-------------|
 | `project_id` | Yes | Unique identifier for your project |
-| `project_name` | No | Human-readable project name |
 | `target_file` | Yes | Excel filename in `project_space/` |
-| `governance_config` | No | Override default thresholds |
+| `stability_threshold` | No | Maximum allowed coefficient of variation (default 0.15) |
+| `overlap_integral_cutoff` | No | Minimum overlap required between distributions (default 0.05) |
 | `assertions` | Yes | Array of monitored cells |
 
 ### Governance Config
 
-| Field | Default | Description |
-|-------|---------|-------------|
-| `stability_threshold` | 0.15 | Maximum allowed coefficient of variation |
-| `overlap_integral_cutoff` | 0.05 | Minimum overlap required between distributions |
-| `freshness_sla_enforcement` | true | Enforce SLA deadlines |
+
 
 ---
 
@@ -62,18 +52,14 @@ Each assertion binds a cell in your Excel file to a governance rule.
 {
   "id": "ast-001",
   "logical_name": "quarterly_revenue",
-  "description": "Q1 2026 revenue projection",
   "owner_role": "VP of Sales",
   "last_updated": "2026-01-15T10:00:00Z",
   "sla_days": 7,
-  
   "binding": {
     "cell": "B5",
     "sheet": "Dashboard"
   },
-  
   "baseline_value": 1000000.0,
-  
   "distribution": {
     "min": 850000.0,
     "mode": 1000000.0,
@@ -88,7 +74,6 @@ Each assertion binds a cell in your Excel file to a governance rule.
 |-------|----------|-------------|
 | `id` | Yes | Unique identifier (e.g., `ast-001`) |
 | `logical_name` | Yes | Short name for the metric |
-| `description` | No | Human-readable explanation |
 | `owner_role` | Yes | Who is accountable for this value |
 | `last_updated` | Yes | ISO 8601 timestamp of last review |
 | `sla_days` | Yes | Days before value is considered stale |

@@ -18,7 +18,7 @@ class GateEngine:
     The Brain: Implements 4-Gate Analysis
     - Gate 1: Freshness (Temporal Decay)
     - Gate 2: Stability (Distribution Overlap)
-    - Gate 3: Convergence (Rate of Change)
+    - Gate 3: Collision (Conflict Detection)
     - Gate 4: Structure (Formula Hijack Detection)
     """
     
