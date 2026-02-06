@@ -1,0 +1,1 @@
+// Moved to documentation/MANIFEST_SETUP_GUIDE.md

@@ -1,3 +1,10 @@
+For all detailed documentation, guides, and developer information, please refer to the [documentation](documentation/) folder.
+
+This README only provides a high-level overview. All other documentation files (such as USER_GUIDE.md, DEVELOPER.md, MANIFEST_SETUP_GUIDE.md, LICENSE, and guardian.spec) have been moved to the documentation folder for better organization.
+
+## Support
+
+For issues, questions, or feedback, please contact your system administrator or refer to the USER_GUIDE.md for detailed documentation.
 # DRE Engine - Data Reliability Engine
 
 **Epistemic Governance for Strategic Models**
