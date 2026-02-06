@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field, field_validator
 from datetime import datetime
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Tuple
 
 class PertDistribution(BaseModel):
     min: float
@@ -19,6 +19,7 @@ class PertDistribution(BaseModel):
 
 class DataBinding(BaseModel):
     cell: str
+    sheet: Optional[str] = None  # Sheet name for multi-sheet workbooks
     named_range: Optional[str] = None
     formula_hash: Optional[str] = None
 
@@ -39,6 +40,7 @@ class DREManifest(BaseModel):
     stability_threshold: float = 0.15
     overlap_integral_cutoff: float = 0.05
     assertions: List[Assertion]
+    conflict_pairs: Optional[List[Tuple[str, str]]] = None  # Pairs of assertion IDs for Gate 3 analysis
 
 # Alias for backward compatibility
 Manifest = DREManifest

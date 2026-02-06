@@ -205,6 +205,7 @@ export default function Galaxy({
   rotationSpeed = 0.1,
   autoCenterRepulsion = 0,
   transparent = true,
+  ...rest
 }: GalaxyProps) {
   const ctnDom = useRef<HTMLDivElement>(null);
   const targetMousePos = useRef({ x: 0.5, y: 0.5 });
@@ -346,5 +347,5 @@ export default function Galaxy({
     transparent
   ]);
 
-  return <div ref={ctnDom} style={{ width: '100%', height: '100%', position: 'relative' }} />;
+  return <div ref={ctnDom} style={{ width: '100%', height: '100%', position: 'relative' }} {...rest} />;
 }

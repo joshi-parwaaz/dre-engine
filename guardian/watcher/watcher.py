@@ -7,7 +7,7 @@ from threading import Timer, Lock
 
 # Configure logging for a background daemon
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format='%(asctime)s - [GUARDIAN] - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger("DREWatcher")
@@ -60,7 +60,7 @@ def run_gate_logic(filepath):
     """
     Placeholder for Phase 3 logic.
     """
-    print(f">>> GATE ENGINE: Analyzing {filepath}")
+    logger.info(f"Gate Engine: Analyzing {filepath}")
 
 if __name__ == "__main__":
     # In Phase 3, these values will be pulled dynamically from manifest.json

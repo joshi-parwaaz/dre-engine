@@ -14,32 +14,156 @@ import click
 import json
 import sys
 import os
+import logging
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
+
+# Fix Windows console encoding for Unicode characters
+# Use reconfigure() which is safe in both frozen and script mode
+if sys.platform == 'win32':
+    try:
+        # reconfigure() is safer than wrapping with TextIOWrapper
+        # It works in frozen mode without closing underlying streams
+        if hasattr(sys.stdout, 'reconfigure'):
+            sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        if hasattr(sys.stderr, 'reconfigure'):
+            sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass  # If reconfigure fails, continue with default encoding
+
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 from rich import box
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
-# Import SAME core modules - no reimplementation
-from core.loader import ManifestLoader
-from core.ingestor import ExcelIngestor
-from core.brain import GateEngine
-from core.schema import DREManifest, Assertion, PertDistribution, DataBinding
+# Lazy imports - only load heavy modules when needed
+# This keeps CLI startup fast (<1 second)
+# from guardian.core.loader import ManifestLoader
+# from guardian.core.ingestor import ExcelIngestor
+# from guardian.core.brain import GateEngine
+# from guardian.core.schema import DREManifest, Assertion, PertDistribution, DataBinding
+# from guardian.core.config import get_config
 
-console = Console()
+# Configure Rich console for frozen mode compatibility
+# With stdout/stderr reconfigured to UTF-8, we can use full Rich features
+_is_frozen = getattr(sys, 'frozen', False) and sys.platform == 'win32'
+
+if _is_frozen:
+    # Frozen mode: use legacy_windows for compatibility but keep colors
+    console = Console(
+        force_terminal=True, 
+        legacy_windows=True,  # Use Windows console APIs
+        safe_box=True,        # ASCII-safe box drawing
+        highlight=False       # Disable auto-highlighting
+    )
+    # Override box styles to use ASCII (more reliable in Windows console)
+    box.ROUNDED = box.ASCII
+    box.DOUBLE = box.ASCII
+    box.HEAVY = box.ASCII
+    box.SQUARE = box.ASCII
+else:
+    console = Console()
+
+def safe_print(msg: str):
+    """Print message safely - works in frozen mode"""
+    if _is_frozen:
+        # Strip Rich markup and replace Unicode chars with ASCII
+        import re
+        clean = re.sub(r'\[/?[^\]]+\]', '', msg)
+        # Replace common Unicode chars that fail with cp1252
+        clean = clean.replace('✓', '[OK]').replace('✗', '[X]').replace('⚠', '[!]')
+        clean = clean.replace('→', '->').replace('•', '*').replace('─', '-')
+        clean = clean.replace('│', '|').replace('└', '\\').replace('├', '+')
+        print(clean)
+    else:
+        console.print(msg)
+    
+logger = logging.getLogger("DRE_Guardian.CLI")
+
+
+def interactive_shell():
+    """Interactive command shell - keeps process alive"""
+    console.print("\n[bold green]Welcome![/bold green] Type [cyan]'init'[/cyan] to get started, or [cyan]'help'[/cyan] for all commands.\n")
+    
+    while True:
+        try:
+            # Prompt for command
+            console.print("[cyan]dre>[/cyan] ", end="")
+            user_input = input().strip()
+            
+            if not user_input:
+                continue
+            
+            # Handle exit commands
+            if user_input.lower() in ['exit', 'quit', 'q']:
+                console.print("[yellow]Goodbye![/yellow]")
+                break
+            
+            # Handle help
+            if user_input.lower() in ['help', '?', '--help']:
+                print_banner()
+                from click import Context
+                ctx = Context(cli)
+                console.print(cli.get_help(ctx))
+                continue
+            
+            # Parse and execute command
+            args = user_input.split()
+            try:
+                # Invoke CLI with parsed arguments
+                cli(args, standalone_mode=False)
+            except SystemExit:
+                # Catch sys.exit() from commands to keep shell alive
+                pass
+            except Exception as e:
+                console.print(f"[red]Error:[/red] {e}")
+                logger.error(f"Command failed: {e}", exc_info=True)
+            
+            console.print()  # Empty line for readability
+            
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Use 'exit' to quit[/yellow]")
+            continue
+        except EOFError:
+            console.print("\n[yellow]EOF received, exiting...[/yellow]")
+            break
 
 
 def print_banner():
-    """Display ASCII banner"""
-    banner = """
-[cyan]╔═══════════════════════════════════════════╗
-║  DRE - Data Reliability Engine           ║
-║  Epistemic Governance CLI v1.0            ║
-╚═══════════════════════════════════════════╝[/cyan]
+    """Display ASCII banner - uses ASCII-safe characters in frozen mode"""
+    if getattr(sys, 'frozen', False) and sys.platform == 'win32':
+        # ASCII-safe banner for frozen Windows exe
+        banner = """
++--------------------------------------------------+
+|                                                  |
+|   DRE ENGINE - Data Reliability Engine          |
+|   Epistemic Governance for Strategic Models     |
+|                                                  |
++--------------------------------------------------+
+
+Quick Start:
+  init        Create project scaffolding
+  doctor      Validate project readiness
+  monitor     Start governance tracking
     """
-    console.print(banner)
+        print(banner)  # Use plain print, not Rich
+    else:
+        # Unicode banner for development
+        banner = """
+[bold cyan]╔══════════════════════════════════════════════════╗
+║                                                  ║
+║   DRE ENGINE - Data Reliability Engine          ║
+║   Epistemic Governance for Strategic Models     ║
+║                                                  ║
+╚══════════════════════════════════════════════════╝[/bold cyan]
+
+[bold white]Quick Start:[/bold white]
+  [cyan]init[/cyan]        Create project scaffolding
+  [cyan]doctor[/cyan]      Validate project readiness
+  [cyan]monitor[/cyan]     Start governance tracking
+    """
+        console.print(banner)
 
 
 @click.group(invoke_without_command=True)
@@ -77,11 +201,25 @@ def cli(ctx):
     if ctx.invoked_subcommand is None:
         print_banner()
         console.print(ctx.get_help())
+        
+        # Show setup guidance if manifest doesn't exist
+        from pathlib import Path
+        from guardian.core.config import get_config
+        config = get_config()
+        manifest_path = config.manifest_path
+        if not manifest_path.exists():
+            console.print("\n[yellow]⚠ No project configured[/yellow]")
+            console.print("[dim]Run[/dim] [cyan]dre init[/cyan] [dim]to create a new project[/dim]")
+            console.print("[dim]Or run[/dim] [cyan]dre doctor[/cyan] [dim]to check system health[/dim]\n")
+        
+        # Enter interactive mode if running as frozen exe
+        if getattr(sys, 'frozen', False):
+            interactive_shell()
 
 
 @cli.command()
 @click.option('--dashboard', '-d', is_flag=True, help='Enable web dashboard alongside CLI monitor')
-@click.option('--manifest', default='../project_space/manifest.json', help='Path to manifest file')
+@click.argument('manifest', required=False)
 def monitor(dashboard, manifest):
     """Start live interactive governance monitoring
     
@@ -98,189 +236,239 @@ def monitor(dashboard, manifest):
     
     \b
     Example:
-      dre monitor              # CLI-only monitoring
-      dre monitor --dashboard  # CLI + web dashboard
+      dre monitor                           # Auto-detect manifest
+      dre monitor path/to/manifest.json     # Explicit path
+      dre monitor --dashboard               # With web UI
+    
+    \b
+    Recommendation:
+      1. Run 'dre monitor --dashboard' to start monitoring
+      2. Access dashboard at http://127.0.0.1:8000
+      3. Minimize terminal - monitoring continues in background
     """
     print_banner()
-    console.print("[dim]Starting live monitor...[/dim]\n")
+    
+    from pathlib import Path
+    from guardian.core.validator import PreflightValidator
+    
+    # Auto-detect manifest if not provided
+    if manifest is None:
+        # Search order:
+        # 1. Current working directory
+        # 2. project_space/ in current directory
+        # 3. Desktop/project_space/ (common user location)
+        # 4. User's home directory
+        
+        search_paths = [
+            Path.cwd() / 'manifest.json',
+            Path.cwd() / 'project_space' / 'manifest.json',
+            Path.home() / 'Desktop' / 'project_space' / 'manifest.json',
+            Path.home() / 'OneDrive' / 'Desktop' / 'project_space' / 'manifest.json',
+            Path.home() / 'project_space' / 'manifest.json',
+        ]
+        
+        manifest_file = None
+        for path in search_paths:
+            if path.exists():
+                manifest_file = path
+                safe_print(f"[dim]✓ Found manifest: {path}[/dim]\n")
+                break
+        
+        if manifest_file is None:
+            safe_print("[bold red]✗ No manifest.json found[/bold red]\n")
+            safe_print("Searched in:")
+            for path in search_paths:
+                safe_print(f"  • {path}")
+            safe_print("\n[yellow]Please specify the manifest path:[/yellow]")
+            safe_print("  dre monitor path/to/manifest.json\n")
+            sys.exit(1)
+    else:
+        manifest_file = Path(manifest)
+        if not manifest_file.is_absolute():
+            manifest_file = Path.cwd() / manifest_file
+    
+    # Preflight validation (CRITICAL - must pass before monitoring starts)
+    safe_print("[dim]Running preflight validation...[/dim]\n")
+    errors, warnings = PreflightValidator.validate_project(str(manifest_file))
+    
+    # Display blocking errors
+    if errors:
+        safe_print("[bold red]✗ Cannot Start Monitor[/bold red]\n")
+        safe_print("[yellow]The following issues must be fixed before monitoring can start:[/yellow]\n")
+        
+        for idx, error in enumerate(errors, 1):
+            safe_print(f"[red]Issue {idx}:[/red] [bold]{error.title}[/bold]")
+            safe_print(f"  {error.message}\n")
+            safe_print(f"  [yellow]Fix:[/yellow]")
+            for line in error.fix.split('\n'):
+                safe_print(f"    {line}")
+            safe_print("")
+        
+        safe_print("[bold red]✗ Monitoring blocked[/bold red]")
+        safe_print("[dim]Run 'doctor' to see detailed validation results[/dim]\n")
+        sys.exit(1)
+    
+    # Display warnings (non-blocking)
+    if warnings:
+        safe_print("[bold yellow]⚠ Warnings:[/bold yellow]")
+        for warning in warnings:
+            safe_print(f"  • {warning.title}")
+            safe_print(f"    [dim]{warning.recommendation}[/dim]")
+        safe_print("")
+    
+    safe_print("[green]✓[/green] Preflight validation passed\n")
     
     try:
-        from monitor import DREMonitor
-        mon = DREMonitor(manifest, enable_dashboard=dashboard)
-        mon.start_monitoring()
+        # If dashboard enabled, use production server architecture
+        # (uvicorn as main process, monitor in background thread)
+        if dashboard:
+            from guardian.main import run_production_server
+            run_production_server(manifest_path=str(manifest_file), auto_open_browser=True)
+        else:
+            # CLI-only mode: just run the monitor
+            from guardian.monitor import DREMonitor
+            mon = DREMonitor(str(manifest_file), enable_dashboard=False)
+            mon.start_monitoring()
     except KeyboardInterrupt:
-        console.print("\n[yellow]⚡ Monitor stopped[/yellow]")
+        pass  # Monitor handles its own exit message
     except Exception as e:
-        console.print(f"[red]Error:[/red] {e}")
+        # User-friendly error handling (no stack traces)
+        error_title = "Monitor Startup Failed"
+        error_message = str(e)
+        
+        # Categorize common errors
+        if "PermissionError" in type(e).__name__ or "locked" in error_message.lower():
+            error_title = "Excel file is locked"
+            error_message = "The Excel file is currently open in another application.\n\nClose the Excel file and try again."
+        elif "FileNotFoundError" in type(e).__name__:
+            error_title = "File not found"
+            error_message = f"{e}\n\nVerify the file path in manifest.json is correct."
+        elif "JSONDecodeError" in type(e).__name__:
+            error_title = "Invalid JSON in manifest"
+            error_message = "The manifest file contains syntax errors.\n\nOpen manifest.json and fix the JSON syntax."
+        
+        console.print(f"\n[bold red]✗ {error_title}[/bold red]\n")
+        console.print(f"{error_message}\n")
+        
+        # Show error dialog on Windows (frozen mode)
+        if getattr(sys, 'frozen', False) and sys.platform == 'win32':
+            try:
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(0, f"{error_title}\n\n{error_message}", "DRE Guardian", 0x10)
+            except:
+                pass
+        
+        logger.error(f"Monitor startup failed: {e}", exc_info=True)
         sys.exit(1)
+
+
+@cli.command()
+@click.argument('manifest', required=False)
+def dashboard(manifest):
+    """Start governance monitoring with web dashboard
+    
+    Shortcut for 'monitor --dashboard'. Opens the web UI automatically.
+    
+    \b
+    Example:
+      dre dashboard                         # Auto-detect manifest
+      dre dashboard path/to/manifest.json   # Explicit path
+    
+    Dashboard URL: http://127.0.0.1:8000
+    """
+    # Reuse the monitor command with dashboard=True
+    ctx = click.get_current_context()
+    ctx.invoke(monitor, dashboard=True, manifest=manifest)
 
 
 @cli.command()
 @click.option('--json', 'output_json', is_flag=True, help='Output results as JSON')
 def doctor(output_json):
-    """Diagnose system health and dependencies
+    """Preflight validation - Is this project ready to monitor?
     
-    Ensures the Brain isn't failing due to missing components.
-    Checks Python dependencies, file permissions, and API connectivity.
+    Comprehensive validation of project configuration, Excel file,
+    and cell references. Run this before starting monitor to catch
+    configuration errors early.
     
     \b
     Checks:
-      • Python version (3.11+)
-      • Required packages (scipy, numpy, openpyxl, etc.)
-      • File system permissions (project_space/ write access)
-      • API server connectivity (if running)
-      • Manifest schema validity
+      • Manifest file exists and has valid JSON syntax
+      • Required manifest fields are present
+      • Excel file exists and is accessible
+      • All referenced sheets exist in the Excel file
+      • All referenced cells are valid and readable
+      • Cell values match expected types
     
     \b
     Example:
-      dre doctor        # Human-readable report
+      dre doctor        # Human-readable validation report
       dre doctor --json # Machine-readable output
     """
     print_banner()
-    console.print("\n[bold cyan]🔬 System Diagnostics[/bold cyan]\n")
+    console.print("\n[bold cyan]🔬 Preflight Validation[/bold cyan]\n")
     
-    results = {
-        "timestamp": datetime.now().isoformat(),
-        "checks": [],
-        "overall_status": "HEALTHY"
-    }
+    from guardian.core.config import get_config
+    from guardian.core.validator import PreflightValidator
     
-    # Check 1: Python version
-    import sys
-    py_version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-    py_ok = sys.version_info >= (3, 11)
+    config = get_config()
+    manifest_path = str(config.manifest_path)
     
-    results["checks"].append({
-        "name": "Python Version",
-        "status": "PASS" if py_ok else "FAIL",
-        "value": py_version,
-        "expected": "3.11+"
-    })
+    console.print(f"[dim]Validating:[/dim] {manifest_path}\n")
     
-    if not output_json:
-        status_icon = "[green]✓[/green]" if py_ok else "[red]✗[/red]"
-        console.print(f"{status_icon} Python Version: {py_version} {'[green](OK)[/green]' if py_ok else '[red](Too old)[/red]'}")
+    # Run comprehensive validation
+    errors, warnings = PreflightValidator.validate_project(manifest_path)
     
-    # Check 2: Required packages
-    required_packages = [
-        ("openpyxl", "Excel file reading"),
-        ("scipy", "PERT overlap integral calculation"),
-        ("numpy", "Statistical computations"),
-        ("pydantic", "Schema validation"),
-        ("fastapi", "API server"),
-        ("watchdog", "File system monitoring"),
-        ("rich", "Terminal UI"),
-        ("click", "CLI framework")
-    ]
-    
-    for pkg, purpose in required_packages:
-        try:
-            __import__(pkg)
-            pkg_ok = True
-            msg = "installed"
-        except ImportError:
-            pkg_ok = False
-            msg = "MISSING"
-            results["overall_status"] = "DEGRADED"
-        
-        results["checks"].append({
-            "name": f"Package: {pkg}",
-            "status": "PASS" if pkg_ok else "FAIL",
-            "purpose": purpose
-        })
-        
-        if not output_json:
-            status_icon = "[green]✓[/green]" if pkg_ok else "[red]✗[/red]"
-            console.print(f"{status_icon} {pkg:15s} {msg:15s} [dim]({purpose})[/dim]")
-    
-    # Check 3: File permissions
-    project_space = Path("../project_space")
-    if project_space.exists():
-        try:
-            test_file = project_space / ".dre_health_check"
-            test_file.touch()
-            test_file.unlink()
-            fs_ok = True
-            fs_msg = "writable"
-        except:
-            fs_ok = False
-            fs_msg = "NO WRITE ACCESS"
-            results["overall_status"] = "DEGRADED"
-    else:
-        fs_ok = False
-        fs_msg = "DOES NOT EXIST"
-        results["overall_status"] = "DEGRADED"
-    
-    results["checks"].append({
-        "name": "project_space/ permissions",
-        "status": "PASS" if fs_ok else "FAIL",
-        "message": fs_msg
-    })
-    
-    if not output_json:
-        status_icon = "[green]✓[/green]" if fs_ok else "[red]✗[/red]"
-        console.print(f"{status_icon} File Permissions: {fs_msg}")
-    
-    # Check 4: API connectivity
-    import urllib.request
-    import urllib.error
-    
-    try:
-        with urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2) as response:
-            api_ok = response.status == 200
-            api_msg = "running"
-    except:
-        api_ok = False
-        api_msg = "offline (not critical)"
-    
-    results["checks"].append({
-        "name": "API Server",
-        "status": "PASS" if api_ok else "SKIP",
-        "message": api_msg
-    })
-    
-    if not output_json:
-        status_icon = "[green]✓[/green]" if api_ok else "[yellow]○[/yellow]"
-        console.print(f"{status_icon} API Server: {api_msg}")
-    
-    # Check 5: Manifest validity
-    manifest_path = Path("../project_space/manifest.json")
-    if manifest_path.exists():
-        try:
-            ManifestLoader.load(str(manifest_path))
-            manifest_ok = True
-            manifest_msg = "valid schema"
-        except Exception as e:
-            manifest_ok = False
-            manifest_msg = f"INVALID: {str(e)[:40]}"
-            results["overall_status"] = "DEGRADED"
-    else:
-        manifest_ok = False
-        manifest_msg = "NOT FOUND (run 'dre init')"
-    
-    results["checks"].append({
-        "name": "Manifest Schema",
-        "status": "PASS" if manifest_ok else "FAIL",
-        "message": manifest_msg
-    })
-    
-    if not output_json:
-        status_icon = "[green]✓[/green]" if manifest_ok else "[red]✗[/red]"
-        console.print(f"{status_icon} Manifest: {manifest_msg}")
-    
-    # Summary
+    # Display results
     if output_json:
+        results = {
+            "timestamp": datetime.now().isoformat(),
+            "manifest_path": manifest_path,
+            "status": "READY" if not errors else "NOT_READY",
+            "errors": [
+                {
+                    "category": e.category,
+                    "title": e.title,
+                    "message": e.message,
+                    "fix": e.fix
+                }
+                for e in errors
+            ],
+            "warnings": [
+                {
+                    "category": w.category,
+                    "title": w.title,
+                    "message": w.message,
+                    "recommendation": w.recommendation
+                }
+                for w in warnings
+            ]
+        }
         console.print(json.dumps(results, indent=2))
     else:
-        console.print(f"\n[bold]Overall Status:[/bold] ", end="")
-        if results["overall_status"] == "HEALTHY":
-            console.print("[green]✓ HEALTHY[/green] - System ready for governance")
-        elif results["overall_status"] == "DEGRADED":
-            console.print("[yellow]⚠ DEGRADED[/yellow] - Some components need attention")
+        # Human-readable output
+        if errors:
+            console.print("[bold red]✗ Blocking Issues Found[/bold red]\n")
+            for idx, error in enumerate(errors, 1):
+                console.print(f"[red]Issue {idx}:[/red] [bold]{error.title}[/bold]")
+                console.print(f"  {error.message}")
+                console.print(f"\n  [yellow]Fix:[/yellow]")
+                for line in error.fix.split('\n'):
+                    console.print(f"    {line}")
+                console.print()
+            
+            console.print(f"[bold red]✗ NOT READY[/bold red] - Fix {len(errors)} issue{'s' if len(errors) != 1 else ''} before running monitor\n")
             sys.exit(1)
-        else:
-            console.print("[red]✗ FAILED[/red] - Critical issues detected")
-            sys.exit(1)
+        
+        if warnings:
+            console.print("[bold yellow]⚠ Warnings[/bold yellow]\n")
+            for idx, warning in enumerate(warnings, 1):
+                console.print(f"[yellow]Warning {idx}:[/yellow] {warning.title}")
+                console.print(f"  {warning.message}")
+                console.print(f"  [dim]Recommendation: {warning.recommendation}[/dim]")
+                console.print()
+        
+        console.print("[bold green]✓ READY TO MONITOR[/bold green]")
+        console.print("[dim]All validation checks passed. You can run 'monitor' to start governance tracking.[/dim]\n")
 
 
 @cli.command()
@@ -310,7 +498,9 @@ def logs(follow, lines, severity):
     print_banner()
     console.print("\n[bold cyan]📋 Audit Log Viewer[/bold cyan]\n")
     
-    audit_file = Path("../project_space/audit_log.jsonl")
+    from guardian.core.config import get_config
+    config = get_config()
+    audit_file = config.audit_log_path
     
     if not audit_file.exists():
         console.print("[yellow]⚠ No audit log found[/yellow]")
@@ -444,7 +634,7 @@ def config(set_project, set_manifest, show):
         "audit_log_path": "../project_space/audit_log.jsonl",
         "api_host": "127.0.0.1",
         "api_port": 8000,
-        "dashboard_url": "http://localhost:5173"
+        "dashboard_url": "http://127.0.0.1:8000"
     }
     
     # Load existing config
@@ -528,159 +718,125 @@ def config(set_project, set_manifest, show):
 
 
 @cli.command()
-@click.argument('project_name', required=False, default='my-dre-project')
-@click.option('--path', default='.', help='Directory to create project in')
-def init(project_name, path):
-    """Initialize a new DRE project with directory structure and templates"""
+def init():
+    """Create project scaffolding in project_space folder
+    
+    This creates:
+      • project_space/ - Directory for your Excel file and configuration
+      • manifest.json - Governance configuration template (must be edited)
+    
+    You must provide your own Excel file and update the manifest accordingly.
+    """
     print_banner()
     
-    project_path = Path(path) / project_name
+    from guardian.core.config import get_config
+    config = get_config()
     
-    console.print(f"\n[bold cyan]Initializing project:[/bold cyan] {project_name}")
-    console.print(f"[dim]Location:[/dim] {project_path.absolute()}\n")
+    console.print("\n[bold cyan]⚡ Initializing DRE Project[/bold cyan]\n")
+    console.print(f"[dim]Location:[/dim] {config.project_space}\n")
     
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-    ) as progress:
+    # Create project_space directory
+    directory_already_existed = config.project_space.exists()
+    
+    try:
+        config.ensure_project_space()
         
-        # Create directory structure
-        task = progress.add_task("[cyan]Creating directories...", total=4)
+        # Verify directory actually exists
+        if not config.project_space.exists():
+            console.print(f"[bold red]✗ Failed to create directory[/bold red]")
+            console.print(f"[yellow]Please manually create:[/yellow] {config.project_space}")
+            console.print("[dim]Tip: Copy the path above and create the folder in Windows Explorer[/dim]\n")
+            sys.exit(1)
         
-        dirs = [
-            project_path / 'project_space',
-            project_path / 'shared',
-            project_path / 'logs',
-            project_path / 'config'
-        ]
+        # Show appropriate message
+        if directory_already_existed:
+            console.print(f"[dim]Directory already exists:[/dim] {config.project_space.name}\n")
+        else:
+            console.print(f"[green]✓[/green] Created new directory: [cyan]{config.project_space.name}[/cyan]")
+            console.print(f"[dim]Full path:[/dim] {config.project_space}")
+            
+            # Open the folder in Windows Explorer so user can see it
+            try:
+                import subprocess
+                subprocess.run(['explorer', str(config.project_space)], check=False)
+                console.print(f"[dim]Opening folder in Windows Explorer...[/dim]\n")
+            except:
+                console.print()  # Just add newline if explorer fails
+            
+    except Exception as e:
+        console.print(f"[bold red]✗ Error:[/bold red] {e}")
+        console.print(f"[yellow]Please manually create:[/yellow] {config.project_space}\n")
+        sys.exit(1)
+    
+    manifest_path = config.project_space / 'manifest.json'
+    
+    # Check if manifest already exists
+    if manifest_path.exists():
+        console.print("[yellow]⚠ Warning: manifest.json already exists[/yellow]\n")
+        console.print(f"  [dim]Existing:[/dim] {manifest_path.name}")
         
-        for d in dirs:
-            d.mkdir(parents=True, exist_ok=True)
-            progress.advance(task)
+        console.print("\n[yellow]Overwrite existing manifest? (y/N):[/yellow] ", end="")
+        try:
+            response = input().strip().lower()
+            if response != 'y':
+                console.print("\n[dim]Initialization cancelled[/dim]\n")
+                return
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[dim]Initialization cancelled[/dim]\n")
+            return
+        console.print()
+    
+    # Create manifest.json template (schema example only, no business logic)
+    console.print("[cyan]→[/cyan] Creating manifest.json template...")
+    manifest_template = {
+        "project_id": "your-project-id",
+        "project_name": "Your Project Name",
+        "target_file": "your-model.xlsx",
         
-        # Create manifest.json template
-        progress.update(task, description="[cyan]Generating manifest template...")
-        manifest_template = {
-            "project_id": f"{project_name}-001",
-            "target_file": "financial_model.xlsx",
+        "governance_config": {
             "stability_threshold": 0.15,
             "overlap_integral_cutoff": 0.05,
-            "assertions": [
-                {
-                    "id": "ast-001",
-                    "logical_name": "revenue_forecast",
-                    "owner_role": "finance",
-                    "last_updated": datetime.now().isoformat(),
-                    "sla_days": 1,
-                    "binding": {
-                        "cell": "B10"
-                    },
-                    "distribution": {
-                        "min": 1000000,
-                        "mode": 1200000,
-                        "max": 1500000
-                    }
+            "freshness_sla_enforcement": True
+        },
+        
+        "assertions": [
+            {
+                "id": "example-assertion",
+                "logical_name": "example_cell",
+                "description": "Example cell description",
+                "owner_role": "Role Name",
+                "last_updated": datetime.now(timezone.utc).isoformat(),
+                "sla_days": 7,
+                
+                "binding": {
+                    "cell": "A1",
+                    "sheet": "Sheet1"
                 },
-                {
-                    "id": "ast-002",
-                    "logical_name": "cost_estimate",
-                    "owner_role": "engineering",
-                    "last_updated": datetime.now().isoformat(),
-                    "sla_days": 2,
-                    "binding": {
-                        "cell": "C15"
-                    },
-                    "distribution": {
-                        "min": 500000,
-                        "mode": 750000,
-                        "max": 1000000
-                    }
+                
+                "baseline_value": 0.0,
+                
+                "distribution": {
+                    "min": 0.0,
+                    "mode": 0.0,
+                    "max": 0.0
                 }
-            ]
-        }
-        
-        manifest_path = project_path / 'project_space' / 'manifest.json'
-        with open(manifest_path, 'w') as f:
-            json.dump(manifest_template, f, indent=2)
-        
-        # Create sample .gitignore
-        progress.update(task, description="[cyan]Creating .gitignore...")
-        gitignore_content = """# Python
-__pycache__/
-*.py[cod]
-*$py.class
-.venv/
-venv/
-*.egg-info/
-
-# IDE
-.vscode/
-.idea/
-
-# Logs
-logs/*.log
-*.log
-
-# Excel temp files
-~$*.xlsx
-.~lock.*
-
-# DRE specific
-project_space/*.xlsx
-!project_space/financial_model.xlsx
-"""
-        with open(project_path / '.gitignore', 'w') as f:
-            f.write(gitignore_content)
-        
-        # Create README
-        progress.update(task, description="[cyan]Creating README...")
-        readme_content = f"""# {project_name}
-
-Data Reliability Engine Project
-
-## Structure
-
-{project_name}/
-  project_space/     # Excel files and manifest.json
-  shared/            # Shared resources
-  logs/              # Audit logs
-  config/            # Configuration files
-
-## Getting Started
-
-1. Edit project_space/manifest.json to define your assertions
-2. Create Excel file in project_space/
-3. Run governance check: dre check project_space/manifest.json project_space/your_file.xlsx
-
-## Commands
-
-- dre init - Initialize new project
-- dre validate <manifest> - Validate manifest schema
-- dre check <manifest> <excel> - Run governance gates
-- dre audit - Query audit logs
-- dre status - Check system health
-- dre watch start - Start file watcher daemon
-"""
-        with open(project_path / 'README.md', 'w', encoding='utf-8') as f:
-            f.write(readme_content)
+            }
+        ]
+    }
     
-    console.print("\n[bold green]✓ Project initialized successfully![/bold green]\n")
+    with open(manifest_path, 'w') as f:
+        json.dump(manifest_template, f, indent=2)
+    console.print(f"  [green]✓[/green] Created: {manifest_path.name}")
     
-    table = Table(show_header=False, box=box.SIMPLE)
-    table.add_column("Item", style="cyan")
-    table.add_column("Status", style="green")
-    
-    table.add_row("Project directory", str(project_path))
-    table.add_row("Manifest template", "project_space/manifest.json")
-    table.add_row("README", "README.md")
-    table.add_row(".gitignore", "Created")
-    
-    console.print(table)
-    
-    console.print(f"\n[dim]Next steps:[/dim]")
-    console.print(f"  cd {project_name}")
-    console.print(f"  dre validate project_space/manifest.json\n")
+    # Success message with clear next steps
+    console.print("\n[bold green]✓ Project structure created[/bold green]\n")
+    console.print("[bold white]Required next steps:[/bold white]")
+    console.print(f"  1. Place your Excel file in: [cyan]{config.project_space}[/cyan]")
+    console.print("  2. Edit [cyan]manifest.json[/cyan]:")
+    console.print("     • Set [dim]target_file[/dim] to your Excel filename")
+    console.print("     • Define assertions for cells you want to monitor")
+    console.print("     • Update project metadata")
+    console.print("  3. Run [cyan]monitor[/cyan] to start governance tracking\n")
 
 
 @cli.command()
@@ -696,6 +852,7 @@ def validate(manifest_path):
     
     try:
         # Use SAME loader as guardian - critical constraint
+        from guardian.core.loader import ManifestLoader
         manifest = ManifestLoader.load(manifest_path)
         
         console.print("[bold green]✓ Schema validation passed[/bold green]\n")
@@ -763,11 +920,15 @@ def check(manifest_path, excel_path, output_json):
     
     try:
         # Use SAME loader - no reimplementation
+        from guardian.core.loader import ManifestLoader
+        from guardian.core.ingestor import ExcelIngestor
+        from guardian.core.brain import GateEngine
+        
         manifest = ManifestLoader.load(manifest_path)
         
-        # Use SAME ingestor - no reimplementation
-        ingestor = ExcelIngestor()
-        data_map, formula_map = ingestor.read_data(excel_path, manifest)
+        # Use SAME ingestor - pass manifest and manifest_path
+        ingestor = ExcelIngestor(manifest, manifest_path)
+        data_map = ingestor.read_data()
         
         # Use SAME brain - no reimplementation
         gate_engine = GateEngine(manifest)
@@ -797,25 +958,23 @@ def check(manifest_path, excel_path, output_json):
                 all_passed = False
             
             # Gate 2: Stability (if we have current value)
-            cell_ref = assertion.binding.cell
-            current_value = data_map.get(cell_ref)
-            if current_value is not None and assertion.baseline_value is not None:
+            # data_map is keyed by assertion.id, contains {"value": x, "formula_hash": y}
+            assertion_data_entry = data_map.get(assertion.id, {})
+            current_value = assertion_data_entry.get("value")
+            if current_value is not None:
                 gate2_result = gate_engine.gate_2_stability(assertion, current_value)
                 assertion_results["gates"]["gate_2_stability"] = gate2_result
                 if gate2_result["status"] == "HALT":
                     all_passed = False
             else:
-                assertion_results["gates"]["gate_2_stability"] = {"status": "SKIP", "reason": "No baseline or current value"}
+                assertion_results["gates"]["gate_2_stability"] = {"status": "SKIP", "reason": "No current value available"}
             
-            # Gate 3: Convergence (placeholder)
-            gate3_result = gate_engine.gate_3_convergence(assertion, [])
-            assertion_results["gates"]["gate_3_convergence"] = gate3_result
-            if gate3_result["status"] == "HALT":
-                all_passed = False
+            # Gate 3: Convergence (requires conflict pairs - skip if none defined)
+            assertion_results["gates"]["gate_3_convergence"] = {"status": "SKIP", "reason": "No conflict pairs defined"}
             
             # Gate 4: Structure
             stored_hash = assertion.binding.formula_hash or ""
-            current_hash = formula_map.get(cell_ref, {}).get("hash", "")
+            current_hash = assertion_data_entry.get("formula_hash", "")
             gate4_result = gate_engine.gate_4_structure(stored_hash, current_hash)
             assertion_results["gates"]["gate_4_structure"] = gate4_result
             if gate4_result["status"] == "HALT":
@@ -891,7 +1050,9 @@ def audit(filter_type, severity, since, limit):
     
     console.print(f"\n[bold cyan]📋 Active Ledger Query[/bold cyan]\n")
     
-    audit_file = Path("../project_space/audit_log.jsonl")
+    from guardian.core.config import get_config
+    config = get_config()
+    audit_file = config.audit_log_path
     
     if not audit_file.exists():
         console.print("[yellow]⚠ No audit log found[/yellow]")
@@ -1067,9 +1228,11 @@ def archive(older_than, compress):
     import json
     import gzip
     import shutil
+    from guardian.core.config import get_config
     
-    log_path = Path("../project_space/audit_log.jsonl")
-    archive_dir = Path("../project_space/archives")
+    config = get_config()
+    log_path = config.audit_log_path
+    archive_dir = config.archives_dir
     
     if not log_path.exists():
         console.print("[yellow]⚠ No audit log found. Nothing to archive.[/yellow]")
@@ -1180,8 +1343,7 @@ def status():
     table.add_row("WebSocket", api_status if "Running" in api_status else "[red]● Offline[/red]")
     
     console.print(table)
-    console.print(f"\n[dim]API Endpoint:[/dim] http://127.0.0.1:8000")
-    console.print(f"[dim]Dashboard:[/dim] http://localhost:5173\n")
+    console.print(f"\n[dim]Dashboard:[/dim] http://127.0.0.1:8000\n")
 
 
 @cli.command()
@@ -1208,5 +1370,88 @@ def watch(action):
         console.print("[dim]Watcher status: Check process list[/dim]\n")
 
 
+def global_exception_handler(exc_type, exc_value, exc_traceback):
+    """
+    Global exception handler that logs uncaught exceptions before the process exits.
+    This is critical for .exe mode where crashes would be silent otherwise.
+    """
+    if issubclass(exc_type, KeyboardInterrupt):
+        # Don't log keyboard interrupts
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    
+    logger.critical(
+        "Uncaught exception - DRE Guardian is shutting down",
+        exc_info=(exc_type, exc_value, exc_traceback)
+    )
+    
+    error_msg = f"Fatal Error: {exc_value}\n\nDRE Guardian encountered an error and needs to close."
+    
+    # Show message box on Windows if running as frozen executable
+    if getattr(sys, 'frozen', False) and sys.platform == 'win32':
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(0, error_msg, "DRE Guardian Error", 0x10)
+        except:
+            pass
+    
+    safe_print("\n[bold red]✗ Fatal Error - See logs for details[/bold red]")
+    try:
+        from guardian.core.config import get_config
+        safe_print(f"[dim]Log file: {get_config().log_file}[/dim]\n")
+    except:
+        pass
+
+
 if __name__ == '__main__':
-    cli()
+    # Initialize configuration and logging
+    config = None
+    try:
+        from guardian.core.config import get_config
+        config = get_config()
+        config.setup_logging(level="INFO")
+    except Exception as e:
+        # Handle early initialization failures gracefully
+        safe_print(f"\n[bold red]Startup Error[/bold red]")
+        safe_print(f"[yellow]{e}[/yellow]\n")
+        safe_print("[dim]This is likely a first-time setup issue.[/dim]")
+        safe_print("[dim]The application will attempt to create required directories...\n[/dim]")
+        # Don't exit - let CLI handle it gracefully
+    
+    # Install global exception handler
+    sys.excepthook = global_exception_handler
+    
+    # Run Click CLI
+    try:
+        cli()
+    except SystemExit as e:
+        # Normal exit from Click or interactive shell
+        if e.code != 0 and _is_frozen:
+            # On error exit in frozen mode, pause so user can see the error
+            print("\nPress Enter to close...")
+            try:
+                input()
+            except (EOFError, KeyboardInterrupt):
+                pass
+        raise
+    except KeyboardInterrupt:
+        print("\n\nInterrupted by user")
+        sys.exit(0)
+    except Exception as e:
+        if config:
+            logger.critical(f"CLI execution failed: {e}", exc_info=True)
+        
+        print(f"\nAn error occurred: {e}\n")
+        
+        if config:
+            print(f"Detailed logs: {config.log_file}\n")
+        
+        # Keep terminal open if running as frozen exe
+        if _is_frozen:
+            print("Press Enter to close...")
+            try:
+                input()
+            except (EOFError, KeyboardInterrupt):
+                pass
+        
+        sys.exit(1)

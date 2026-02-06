@@ -49,7 +49,7 @@ export default function AuditLog({ onClose }: AuditLogProps) {
 
   const fetchSummary = async () => {
     try {
-      const res = await fetch('http://127.0.0.1:8000/api/audit/summary')
+      const res = await fetch('/api/audit/summary')
       const data = await res.json()
       setSummary(data)
     } catch (err) {
@@ -61,7 +61,7 @@ export default function AuditLog({ onClose }: AuditLogProps) {
     try {
       setLoading(true)
       const offset = page * limit
-      const res = await fetch(`http://127.0.0.1:8000/api/audit/recent?limit=${limit}&offset=${offset}`)
+      const res = await fetch(`/api/audit/recent?limit=${limit}&offset=${offset}`)
       const data = await res.json()
       setEvents(data.events || [])
     } catch (err) {

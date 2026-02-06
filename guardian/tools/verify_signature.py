@@ -30,8 +30,9 @@ def verify_audit_log(audit_log_path: str = None):
     Verify all override signatures in the audit log.
     """
     if audit_log_path is None:
-        project_root = Path(__file__).parent.parent.parent
-        audit_log_path = str(project_root / "project_space" / "audit_log.jsonl")
+        from guardian.core.config import get_config
+        config = get_config()
+        audit_log_path = str(config.audit_log_path)
     
     console.print("\n[bold cyan]🔐 Digital Signature Verification[/bold cyan]\n")
     console.print(f"[dim]Audit log: {audit_log_path}[/dim]\n")

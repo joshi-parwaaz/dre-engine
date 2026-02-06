@@ -2,56 +2,158 @@
 DRE Guardian - Interactive CLI Monitor
 Beautiful terminal-based governance monitoring
 """
+import sys
+import os
+# Force UTF-8 encoding for Windows compatibility
+# But only in non-frozen mode - PyInstaller handles this differently
+if sys.platform == "win32" and not getattr(sys, 'frozen', False):
+    os.environ["PYTHONIOENCODING"] = "utf-8"
+    # Reconfigure stdout/stderr for UTF-8 only if buffer is available
+    try:
+        import io
+        if hasattr(sys.stdout, 'buffer') and sys.stdout.buffer is not None:
+            sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+        if hasattr(sys.stderr, 'buffer') and sys.stderr.buffer is not None:
+            sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+    except Exception:
+        pass  # In frozen mode, just use default encoding
+
 from rich.console import Console
 from rich.live import Live
 from rich.layout import Layout
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
+from rich.align import Align
+from rich.columns import Columns
+from rich.style import Style
 from rich import box
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import time
 import sys
 import subprocess
 from pathlib import Path
 import json
 
-from core.loader import ManifestLoader
-from core.ingestor import ExcelIngestor
-from core.brain import GateEngine
-from api.audit_logger import AuditLogger
-from watcher.watcher import DREWatcher
+from guardian.core.loader import ManifestLoader
+from guardian.core.ingestor import ExcelIngestor
+from guardian.core.brain import GateEngine
+from guardian.core.config import get_config
+from guardian.api.audit_logger import AuditLogger
+from guardian.watcher.watcher import DREWatcher
 from watchdog.observers import Observer
 import logging
+try:
+    from pystray import Icon, Menu, MenuItem
+    from PIL import Image, ImageDraw
+    TRAY_AVAILABLE = True
+except ImportError:
+    TRAY_AVAILABLE = False
+    Icon = Menu = MenuItem = Image = ImageDraw = None
+try:
+    from pystray import Icon, Menu, MenuItem
+    from PIL import Image, ImageDraw
+    TRAY_AVAILABLE = True
+except ImportError:
+    TRAY_AVAILABLE = False
 
-console = Console()
+# ═══════════════════════════════════════════════════════════════════════════════
+# Theme Configuration - Matches Dashboard Styling
+# ═══════════════════════════════════════════════════════════════════════════════
+class Theme:
+    """Unified theme matching dashboard design"""
+    # Primary colors from dashboard
+    CYAN = "#00D4FF"
+    GREEN = "#00FF88"
+    YELLOW = "#FFD93D"
+    RED = "#FF6B6B"
+    PURPLE = "#A855F7"
+    ORANGE = "#FF8C42"
+    
+    # Neutral tones
+    DIM = "#6B7280"
+    MUTED = "#9CA3AF"
+    WHITE = "#FFFFFF"
+    
+    # Status colors
+    PASS = GREEN
+    HALT = RED
+    WARN = YELLOW
+    
+    # Semantic styles
+    HEADER = Style(color=CYAN, bold=True)
+    TITLE = Style(color=WHITE, bold=True)
+    ACCENT = Style(color=GREEN, bold=True)
+    STATUS_PASS = Style(color=GREEN, bold=True)
+    STATUS_HALT = Style(color=RED, bold=True)
+    STATUS_WARN = Style(color=YELLOW, bold=True)
+    SUBTLE = Style(color=DIM)
+    LINK = Style(color=CYAN, underline=True)
+
+
+# Configure Rich console for frozen mode compatibility
+_is_frozen = getattr(sys, 'frozen', False) and sys.platform == 'win32'
+
+if _is_frozen:
+    import os
+    os.environ['PYTHONIOENCODING'] = 'utf-8'
+    console = Console(
+        force_terminal=True, 
+        legacy_windows=True, 
+        no_color=True,
+        safe_box=True,
+        highlight=False
+    )
+    # Override default box to use ASCII
+    box.ROUNDED = box.ASCII
+    box.DOUBLE = box.ASCII
+    box.HEAVY = box.ASCII
+    box.SQUARE = box.ASCII
+else:
+    console = Console()
+
+def safe_print(msg: str):
+    """Print message safely - works in frozen mode"""
+    if _is_frozen:
+        import re
+        clean = re.sub(r'\[/?[^\]]+\]', '', msg)
+        print(clean)
+    else:
+        console.print(msg)
+    
 logger = logging.getLogger("DRE_Monitor")
 
 class DREMonitor:
-    def __init__(self, manifest_path: str, enable_dashboard: bool = False):
-        self.manifest_path = manifest_path
-        self.manifest = ManifestLoader.load(manifest_path)
+    def __init__(self, manifest_path: str = None, enable_dashboard: bool = False):
+        # Initialize configuration
+        self.config = get_config(manifest_path)
+        
+        self.manifest_path = str(self.config.manifest_path)
+        self.manifest = ManifestLoader.load(self.manifest_path)
         self.brain = GateEngine(self.manifest)
         
-        # Resolve paths relative to project root (parent of guardian/)
-        project_root = Path(__file__).parent.parent
-        audit_path = project_root / "project_space" / "audit_log.jsonl"
-        self.audit_logger = AuditLogger(str(audit_path))
+        # Use config for audit logger
+        self.audit_logger = AuditLogger(self.config.audit_log_path)
         self.enable_dashboard = enable_dashboard
         
         # State tracking
         self.last_check = None
         self.total_checks = 0
         self.halt_count = 0
+        self._api_port = 8000  # Default, updated if different port used
         self.last_status = "IDLE"
         self.current_assertions = []
         self.watching_file = None
         self.active_bypasses = {}  # Maps assertion_id -> bypass metadata
         self._frontend_process = None  # Track frontend process for cleanup
+        self._api_process = None  # Track uvicorn subprocess for cleanup
+        self.tray_icon = None  # System tray icon
         
         # Dashboard integration
         if enable_dashboard:
             self._start_dashboard()
+            if TRAY_AVAILABLE:
+                self._init_tray_icon()
     
     def register_bypass(self, assertion_ids: list, justification: str, signature: str, 
                        signature_hash: str, timestamp: str, expiry_seconds: int = 3600):
@@ -102,208 +204,576 @@ class DREMonitor:
         
         return True
     
+    def run(self):
+        """
+        Run monitor in background mode (no TUI)
+        
+        This is called when the monitor runs as a background thread
+        alongside the uvicorn server (production server architecture).
+        """
+        # Resolve watch path
+        manifest_dir = Path(self.manifest_path).parent
+        watch_path = str(manifest_dir)
+        self.watching_file = f"{watch_path}/{self.manifest.target_file}"
+        
+        # Register this monitor instance with Bridge
+        import guardian.api.bridge as bridge_module
+        bridge_module.monitor_instance = self
+        
+        # Run initial check
+        self.run_governance_cycle()
+        
+        # Setup file watcher
+        watcher = DREWatcher(
+            callback=self.run_governance_cycle,
+            target_file=self.watching_file,
+            debounce_seconds=0.9
+        )
+        
+        observer = Observer()
+        observer.schedule(watcher, path=watch_path, recursive=False)
+        observer.start()
+        
+        try:
+            # Keep thread alive, checking periodically
+            while True:
+                time.sleep(5)
+        except KeyboardInterrupt:
+            observer.stop()
+            observer.join()
+    
     def _start_dashboard(self):
-        """Start API server and frontend dev server in background for web dashboard"""
-        from threading import Thread
-        from api.bridge import app
-        import uvicorn
+        """Start API server to serve static dashboard from bundled dist/ folder"""
         import subprocess
+        import sys
         
-        # Start FastAPI backend
-        def run_api():
-            uvicorn.run(app, host="127.0.0.1", port=8000, log_level="info")
+        # Verify dashboard build exists (using config that was initialized with manifest_path)
+        dashboard_dist = self.config.dashboard_dir / "dist"
         
-        api_thread = Thread(target=run_api, daemon=True)
-        api_thread.start()
+        if not dashboard_dist.exists():
+            console.print(f"[red]✗ Dashboard build not found at {dashboard_dist}[/red]")
+            console.print(f"[yellow]Build dashboard first: cd dashboard && npm run build[/yellow]")
+            console.print(f"[dim]Looking in: {dashboard_dist}[/dim]")
+            console.print(f"[dim]Is frozen: {self.config.is_frozen}[/dim]")
+            console.print(f"[dim]Bundle dir: {self.config.bundle_dir}[/dim]")
+            return
         
-        # Start Vite frontend dev server
-        dashboard_path = Path(__file__).parent.parent / "dashboard"
-        if dashboard_path.exists():
-            console.print(f"[dim]Starting frontend dev server at {dashboard_path}...[/dim]")
+        console.print(f"[dim]✓ Dashboard found at {dashboard_dist}[/dim]")
+        
+        # Find available port
+        import socket
+        def find_available_port(start_port=8000, max_attempts=3):
+            for port in range(start_port, start_port + max_attempts):
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.bind(('127.0.0.1', port))
+                        return port
+                except OSError:
+                    continue
+            return None
+        
+        port = find_available_port()
+        if port is None:
+            console.print(f"[red]✗ Ports 8000-8002 are all in use[/red]")
+            console.print(f"[yellow]Close other applications and try again[/yellow]")
+            return
+        
+        self._api_port = port
+        
+        # Start uvicorn server
+        try:
+            # In frozen mode (exe), run uvicorn in a background thread
+            # In script mode, use subprocess for better isolation
+            if getattr(sys, 'frozen', False):
+                # Frozen mode: run uvicorn in background thread
+                from threading import Thread
+                import uvicorn
+                from guardian.api import bridge
+                
+                console.print(f"[dim]Starting dashboard server in background thread...[/dim]")
+                
+                def run_uvicorn():
+                    uvicorn.run(
+                        bridge.app,
+                        host="127.0.0.1",
+                        port=port,
+                        log_level="info",
+                        access_log=False
+                    )
+                
+                server_thread = Thread(target=run_uvicorn, daemon=True)
+                server_thread.start()
+                self._api_process = server_thread  # Store for tracking
+            else:
+                # Script mode: run as subprocess
+                python_exe = sys.executable
+                
+                # Create log file in project directory
+                log_file = self.config.manifest_path.parent / "uvicorn.log"
+                
+                if sys.platform == "win32":
+                    with open(log_file, "w") as f:
+                        pass  # Create/clear the file
+                    
+                    self._api_process = subprocess.Popen(
+                        [python_exe, "-m", "uvicorn", "guardian.api.bridge:app",
+                         "--host", "127.0.0.1", "--port", str(port),
+                         "--log-level", "info"],
+                        stdout=open(log_file, "a"),
+                        stderr=subprocess.STDOUT,
+                        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+                        cwd=str(Path(__file__).parent.parent)
+                    )
+                else:
+                    import os as os_module
+                    with open(log_file, "w") as f:
+                        pass
+                        
+                    self._api_process = subprocess.Popen(
+                        [python_exe, "-m", "uvicorn", "guardian.api.bridge:app",
+                         "--host", "127.0.0.1", "--port", str(port),
+                         "--log-level", "info"],
+                        stdout=open(log_file, "a"),
+                        stderr=subprocess.STDOUT,
+                        preexec_fn=os_module.setsid,
+                        cwd=str(Path(__file__).parent.parent)
+                    )
+            
+            dashboard_url = f"http://127.0.0.1:{port}"
+            console.print(f"[green]\u2713[/green] Dashboard server started at [bold blue]{dashboard_url}[/bold blue]")
+            console.print(f"[dim]Server logs: {log_file}[/dim]")
+            
+            time.sleep(3)  # Let server initialize
+            
+            # Auto-open browser
+            import webbrowser
             try:
-                # On Windows, use shell=True to find npm.cmd
-                cmd = ["npm", "run", "dev"]
-                self._frontend_process = subprocess.Popen(
-                    cmd,
-                    cwd=str(dashboard_path),
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    shell=(sys.platform == "win32"),
-                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
-                )
-                console.print(f"[green]✓[/green] Frontend dev server started (PID: {self._frontend_process.pid})")
-            except FileNotFoundError:
-                console.print(f"[yellow]Warning: npm not found. Please run 'npm run dev' manually in dashboard/ folder.[/yellow]")
+                console.print(f"[yellow]→[/yellow] Attempting to open dashboard in browser...")
+                opened = webbrowser.open(dashboard_url)
+                if opened:
+                    console.print(f"[green]✓[/green] Dashboard opened in browser\n")
+                else:
+                    console.print(f"[yellow]⚠[/yellow] Browser may not have opened automatically")
+                    console.print(f"[bold]→ Please manually open:[/bold] [bold blue]{dashboard_url}[/bold blue]\n")
             except Exception as e:
-                console.print(f"[yellow]Warning: Could not start frontend: {e}[/yellow]")
-                console.print(f"[dim]Please run 'npm run dev' manually in dashboard/ folder.[/dim]")
-        else:
-            console.print(f"[yellow]Warning: dashboard folder not found at {dashboard_path}[/yellow]")
+                console.print(f"[yellow]⚠[/yellow] Could not auto-open browser: {e}")
+                console.print(f"[bold]→ Please manually open:[/bold] [bold blue]{dashboard_url}[/bold blue]\n")
+        except Exception as e:
+            console.print(f"[red]✗ Failed to start dashboard server: {e}[/red]")
+            logger.error(f"Dashboard startup error: {e}", exc_info=True)
+    
+    def _init_tray_icon(self):
+        """Initialize system tray icon (Windows notification area) - Silent Guardian"""
+        if not TRAY_AVAILABLE:
+            console.print("[yellow]Note: pystray not installed. Install with: pip install pystray pillow[/yellow]")
+            return
         
-        time.sleep(2)  # Let both initialize
+        from threading import Thread
+        
+        # Create tray icon wrapper
+        class TrayIconWrapper:
+            def __init__(self, manifest_name):
+                self.manifest_name = manifest_name
+                self.icon = None
+                self.halt_active = False
+                
+            def create_image(self, color="green"):
+                """Create shield icon image"""
+                size = 64
+                image = Image.new('RGB', (size, size), 'white')
+                draw = ImageDraw.Draw(image)
+                
+                # Draw shield shape
+                shield_color = {
+                    "green": (46, 204, 113),
+                    "red": (231, 76, 60),
+                    "yellow": (241, 196, 15)
+                }[color]
+                
+                points = [(size//2, 10), (size-10, size//3), (size-10, size*2//3), 
+                          (size//2, size-5), (10, size*2//3), (10, size//3)]
+                draw.polygon(points, fill=shield_color, outline='black')
+                return image
+            
+            def notify_halt(self, message: str = None):
+                """Flash red and show notification on HALT"""
+                if self.icon:
+                    self.halt_active = True
+                    self.icon.icon = self.create_image("red")
+                    
+                    # Use custom message if provided, otherwise default
+                    if message:
+                        # Extract first sentence for title, rest for message body
+                        parts = message.split(":", 1)
+                        if len(parts) == 2:
+                            title = parts[0].strip()
+                            msg_body = parts[1].strip()
+                        else:
+                            title = "⚠️ Data Quality Alert"
+                            msg_body = message
+                    else:
+                        title = "⚠️ Data Quality Alert"
+                        msg_body = "Excel Guardian detected an issue. Click tray icon to review."
+                    
+                    self.icon.notify(title=title, message=msg_body)
+            
+            def reset(self):
+                """Return to green state"""
+                if self.icon:
+                    self.halt_active = False
+                    self.icon.icon = self.create_image("green")
+            
+            def setup(self, icon):
+                """Setup callback when tray starts"""
+                icon.visible = True
+                icon.icon = self.create_image("green")
+            
+            def on_show_dashboard(self):
+                """Open dashboard in browser (user opt-in)"""
+                import webbrowser
+                webbrowser.open(f"http://127.0.0.1:{self._api_port}")
+            
+            def on_exit(self, icon):
+                """Exit the application"""
+                icon.stop()
+                # Don't sys.exit() here - let KeyboardInterrupt handle cleanup
+            
+            def run(self):
+                """Run the tray icon"""
+                menu = Menu(
+                    MenuItem("Show Dashboard", self.on_show_dashboard),
+                    MenuItem("Exit Guardian", self.on_exit)
+                )
+                
+                self.icon = Icon(
+                    name="Excel Guardian",
+                    icon=self.create_image("green"),
+                    title=f"Excel Guardian - Monitoring {self.manifest_name}",
+                    menu=menu
+                )
+                self.icon.run(setup=self.setup)
+        
+        # Create and store wrapper
+        wrapper = TrayIconWrapper(self.manifest.project_id)
+        self.tray_icon = wrapper
+        
+        # Run tray icon in background thread
+        tray_thread = Thread(target=wrapper.run, daemon=True)
+        tray_thread.start()
+        
+        console.print("[green]✓[/green] System tray icon active (Silent Guardian mode)")
     
     def _get_severity_color(self, status: str) -> str:
         """Get Rich color for gate status"""
         if status == "HALT":
-            return "red"
+            return Theme.RED
         elif status == "PASS":
-            return "green"
+            return Theme.GREEN
         elif status == "WARN":
-            return "yellow"
+            return Theme.YELLOW
         else:
-            return "dim"
+            return Theme.DIM
     
     def _create_header(self) -> Panel:
-        """Create header panel"""
-        title = Text()
-        title.append("⚡ ", style="bold yellow")
-        title.append("DRE GUARDIAN", style="bold cyan")
-        title.append(" - Live Governance Monitor", style="dim")
+        """Create stunning ASCII art header matching dashboard theme"""
+        # Modern ASCII art banner
+        banner_lines = [
+            "╔═══════════════════════════════════════════════════════════════════════════════════╗",
+            "║                                                                                   ║",
+            "║   ██████╗  ██████╗ ███████╗     ██████╗ ██╗   ██╗ █████╗ ██████╗ ██████╗         ║",
+            "║   ██╔══██╗██╔══██╗██╔════╝    ██╔════╝ ██║   ██║██╔══██╗██╔══██╗██╔══██╗        ║",
+            "║   ██║  ██║██████╔╝█████╗      ██║  ███╗██║   ██║███████║██████╔╝██║  ██║        ║",
+            "║   ██║  ██║██╔══██╗██╔══╝      ██║   ██║██║   ██║██╔══██║██╔══██╗██║  ██║        ║",
+            "║   ██████╔╝██║  ██║███████╗    ╚██████╔╝╚██████╔╝██║  ██║██║  ██║██████╔╝        ║",
+            "║   ╚═════╝ ╚═╝  ╚═╝╚══════╝     ╚═════╝  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝         ║",
+            "║                                                                                   ║",
+            "╚═══════════════════════════════════════════════════════════════════════════════════╝",
+        ]
         
-        subtitle = Text()
-        subtitle.append(f"Project: {self.manifest.project_id}", style="dim")
+        # Build colored banner
+        banner = Text()
+        for i, line in enumerate(banner_lines):
+            if i == 0 or i == len(banner_lines) - 1:
+                banner.append(line + "\n", style=Theme.CYAN)
+            elif "██" in line:
+                # Color the DRE GUARD text in cyan, rest in dim
+                banner.append(line + "\n", style=Theme.CYAN)
+            else:
+                banner.append(line + "\n", style=Theme.SUBTLE)
+        
+        # Status info line
+        status_line = Text()
+        status_line.append("  ⚡ ", style=Theme.YELLOW)
+        status_line.append("Live Governance Monitor", style=Theme.HEADER)
+        status_line.append("  │  ", style=Theme.SUBTLE)
+        status_line.append(f"Project: ", style=Theme.SUBTLE)
+        status_line.append(f"{self.manifest.project_id}", style=Theme.ACCENT)
+        
         if self.enable_dashboard:
-            subtitle.append(" │ ", style="dim")
-            subtitle.append("Dashboard: http://localhost:5173", style="blue underline")
+            status_line.append("  │  ", style=Theme.SUBTLE)
+            status_line.append("Dashboard: ", style=Theme.SUBTLE)
+            status_line.append(f"http://127.0.0.1:{self._api_port}", style=Theme.LINK)
+        
+        # Use Group instead of Text.assemble for mixed content
+        from rich.console import Group
+        content = Group(
+            Align.center(banner),
+            Align.center(status_line)
+        )
         
         return Panel(
-            Text.assemble(title, "\n", subtitle),
-            box=box.DOUBLE,
-            style="bold white on black"
+            content,
+            box=box.SIMPLE,
+            padding=(0, 0),
+            style="on black"
         )
     
-    def _create_status_bar(self) -> Table:
-        """Create status bar with metrics"""
-        table = Table.grid(padding=(0, 2))
-        table.add_column(style="cyan", justify="left")
-        table.add_column(style="white", justify="left")
-        table.add_column(style="cyan", justify="left")
-        table.add_column(style="white", justify="left")
-        table.add_column(style="cyan", justify="left")
-        table.add_column(style="white", justify="left")
+    def _create_status_bar(self) -> Panel:
+        """Create stunning status bar with modern metrics display"""
+        # Create individual metric cards
+        status_color = Theme.RED if self.last_status == "HALT" else Theme.GREEN if self.last_status == "PASS" else Theme.YELLOW
+        status_icon = "⛔" if self.last_status == "HALT" else "✓" if self.last_status == "PASS" else "⚠"
         
-        status_color = "red" if self.last_status == "HALT" else "green" if self.last_status == "PASS" else "yellow"
+        # Build metrics table with styled cards
+        table = Table.grid(padding=(0, 3), expand=True)
+        table.add_column(justify="center")
+        table.add_column(justify="center")
+        table.add_column(justify="center")
+        table.add_column(justify="center")
+        
+        # Status card
+        status_text = Text()
+        status_text.append(f"{status_icon} ", style=f"bold {status_color}")
+        status_text.append(self.last_status or "READY", style=f"bold {status_color}")
+        
+        # Checks card
+        checks_text = Text()
+        checks_text.append("📊 ", style=Theme.CYAN)
+        checks_text.append(f"{self.total_checks}", style=f"bold {Theme.WHITE}")
+        checks_text.append(" checks", style=Theme.SUBTLE)
+        
+        # Halts card
+        halt_color = Theme.RED if self.halt_count > 0 else Theme.GREEN
+        halts_text = Text()
+        halts_text.append("🚨 ", style=halt_color)
+        halts_text.append(f"{self.halt_count}", style=f"bold {halt_color}")
+        halts_text.append(" halts", style=Theme.SUBTLE)
+        
+        # Time card
+        time_text = Text()
+        time_text.append("🕐 ", style=Theme.CYAN)
+        if self.last_check:
+            time_text.append(self.last_check.strftime("%I:%M:%S %p"), style=Theme.WHITE)
+        else:
+            time_text.append("--:--:--", style=Theme.SUBTLE)
         
         table.add_row(
-            "Status:", f"[{status_color}]●[/{status_color}] {self.last_status}",
-            "Checks:", str(self.total_checks),
-            "HALTs:", f"[red]{self.halt_count}[/red]" if self.halt_count > 0 else "0"
+            Panel(status_text, box=box.ROUNDED, border_style=status_color, padding=(0, 2)),
+            Panel(checks_text, box=box.ROUNDED, border_style=Theme.CYAN, padding=(0, 2)),
+            Panel(halts_text, box=box.ROUNDED, border_style=halt_color, padding=(0, 2)),
+            Panel(time_text, box=box.ROUNDED, border_style=Theme.CYAN, padding=(0, 2))
         )
         
-        if self.last_check:
-            table.add_row(
-                "Last Check:", self.last_check.strftime("%H:%M:%S"),
-                "Watching:", self.watching_file or "N/A",
-                "", ""
-            )
+        # Watching file indicator
+        watch_text = Text()
+        watch_text.append("👁 Watching: ", style=Theme.SUBTLE)
+        watch_text.append(self.watching_file or "No file", style=Theme.CYAN)
         
-        return Panel(table, title="[bold]System Metrics[/bold]", border_style="cyan", box=box.ROUNDED)
+        # Use a simple layout instead of Text.assemble with Align
+        from rich.console import Group
+        content = Group(
+            Align.center(table),
+            Align.center(watch_text)
+        )
+        
+        return Panel(
+            content,
+            title=f"[bold {Theme.CYAN}]━━━ SYSTEM STATUS ━━━[/bold {Theme.CYAN}]",
+            border_style=Theme.CYAN,
+            box=box.DOUBLE,
+            padding=(1, 2)
+        )
     
     def _create_assertions_table(self) -> Panel:
-        """Create live assertions table"""
-        table = Table(title="Assertions", box=box.SIMPLE_HEAD, show_header=True)
-        table.add_column("ID", style="magenta", width=12)
-        table.add_column("Name", style="cyan", width=25)
-        table.add_column("Owner", style="yellow", width=15)
-        table.add_column("G1:Fresh", justify="center", width=10)
-        table.add_column("G2:Stable", justify="center", width=10)
-        table.add_column("G4:Struct", justify="center", width=10)
-        table.add_column("Status", justify="center", width=10)
+        """Create live assertions table with human narratives - themed design"""
         
         if not self.current_assertions:
-            table.add_row("", "[dim]Waiting for first governance cycle...[/dim]", "", "", "", "", "")
-        else:
-            for assertion in self.current_assertions:
-                gates = assertion.get("gate_status", {})
-                g1 = gates.get("freshness", "SKIP")
-                g2 = gates.get("stability", "SKIP")
-                g4 = gates.get("alignment", "SKIP")
-                
-                overall = "HALT" if "HALT" in [g1, g2, g4] else "PASS"
-                
-                table.add_row(
-                    assertion.get("id", "N/A")[:12],
-                    assertion.get("logical_name", "N/A")[:25],
-                    assertion.get("owner_role", "N/A")[:15],
-                    f"[{self._get_severity_color(g1)}]{g1}[/{self._get_severity_color(g1)}]",
-                    f"[{self._get_severity_color(g2)}]{g2}[/{self._get_severity_color(g2)}]",
-                    f"[{self._get_severity_color(g4)}]{g4}[/{self._get_severity_color(g4)}]",
-                    f"[{self._get_severity_color(overall)}]{overall}[/{self._get_severity_color(overall)}]"
-                )
+            empty_content = Text()
+            empty_content.append("\n  ⏳ ", style=Theme.CYAN)
+            empty_content.append("Waiting for first governance cycle...", style=Theme.SUBTLE)
+            empty_content.append("\n")
+            return Panel(
+                empty_content,
+                title=f"[bold {Theme.CYAN}]━━━ DATA QUALITY ALERTS ━━━[/bold {Theme.CYAN}]",
+                border_style=Theme.CYAN,
+                box=box.DOUBLE,
+                padding=(1, 2)
+            )
         
-        return Panel(table, border_style="green" if self.last_status == "PASS" else "red", box=box.ROUNDED)
+        # Show alerts in a more human-readable format
+        content = Text()
+        
+        for assertion in self.current_assertions:
+            gates = assertion.get("gate_status", {})
+            gate_details = assertion.get("gate_details", {})
+            name = assertion.get("logical_name", "Unknown")
+            owner = assertion.get("owner_role", "Unknown")
+            
+            # Check each gate and generate narrative
+            has_issues = False
+            issues = []
+            
+            for gate_key, status in gates.items():
+                if status == "HALT":
+                    has_issues = True
+                    gate_result = gate_details.get(gate_key, {})
+                    
+                    # Generate human narrative
+                    gate_map = {"freshness": "gate_1", "stability": "gate_2", "alignment": "gate_4"}
+                    gate_type = gate_map.get(gate_key, "gate_1")
+                    narrative = self.brain.get_human_narrative(gate_type, gate_result, name)
+                    
+                    issues.append((narrative['title'], narrative['message'], narrative['action']))
+            
+            if has_issues:
+                content.append("\n  ⛔ ", style=Theme.RED)
+                content.append(name, style=f"bold {Theme.RED}")
+                content.append(f"  ({owner})", style=Theme.YELLOW)
+                content.append("\n")
+                
+                for title, message, action in issues:
+                    content.append(f"     └─ {title}\n", style=Theme.ORANGE)
+                    msg_display = message[:75] + "..." if len(message) > 75 else message
+                    content.append(f"        {msg_display}\n", style=Theme.SUBTLE)
+                    action_display = action[:70] + "..." if len(action) > 70 else action
+                    content.append(f"        → {action_display}\n", style=Theme.CYAN)
+            else:
+                content.append("\n  ✓ ", style=Theme.GREEN)
+                content.append(name, style=f"bold {Theme.GREEN}")
+                content.append(f"  ({owner})", style=Theme.SUBTLE)
+                content.append("  All checks passing\n", style=Theme.SUBTLE)
+        
+        border_color = Theme.RED if self.last_status == "HALT" else Theme.GREEN
+        title_icon = "🚨" if self.last_status == "HALT" else "✅"
+        
+        return Panel(
+            content if len(content) > 0 else Text("All assertions passing", style=Theme.GREEN),
+            title=f"[bold {border_color}]━━━ {title_icon} DATA QUALITY ALERTS ━━━[/bold {border_color}]",
+            border_style=border_color,
+            box=box.DOUBLE,
+            padding=(0, 2)
+        )
     
     def _create_audit_log(self) -> Panel:
-        """Create recent audit log panel"""
-        project_root = Path(__file__).parent.parent
-        audit_file = project_root / "project_space" / "audit_log.jsonl"
+        """Create recent audit log panel with modern themed design"""
+        audit_file = self.config.audit_log_path
         
-        table = Table(title="Recent Audit Trail (Last 5)", box=box.SIMPLE, show_header=True)
-        table.add_column("Time", style="cyan", width=10)
-        table.add_column("Event", style="yellow", width=15)
-        table.add_column("Severity", justify="center", width=10)
-        table.add_column("Assertion", style="magenta", width=15)
+        content = Text()
         
         if audit_file.exists():
             entries = []
             try:
-                with open(audit_file, 'r') as f:
+                with open(audit_file, 'r', encoding='utf-8') as f:
                     for line in f:
                         if line.strip():
                             entries.append(json.loads(line))
-            except:
-                pass
+            except Exception as e:
+                content.append(f"Error: {str(e)}\n", style=Theme.RED)
             
-            recent = entries[-5:] if len(entries) > 5 else entries
+            recent = entries[-6:] if len(entries) > 6 else entries
             recent.reverse()
             
             for entry in recent:
-                timestamp = entry.get('timestamp', 'N/A')[:19].split('T')[1] if 'T' in entry.get('timestamp', '') else 'N/A'
-                event = entry.get('event_type', 'UNKNOWN')[:15]
+                # Parse ISO timestamp and convert to local time
+                timestamp_str = entry.get('timestamp', '')
+                if timestamp_str:
+                    try:
+                        dt = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                        local_dt = dt.astimezone()
+                        timestamp = local_dt.strftime('%I:%M %p')
+                    except Exception:
+                        timestamp = 'N/A'
+                else:
+                    timestamp = 'N/A'
+                    
                 severity = entry.get('severity', 'INFO')
-                assertion_id = entry.get('assertion_id', 'N/A')[:15]
                 
-                sev_color = "red" if severity == "CRITICAL" else "yellow" if severity == "WARN" else "green"
+                # Severity icon and color
+                if severity == "CRITICAL":
+                    sev_icon, sev_color = "●", Theme.RED
+                elif severity in ["WARN", "MAJOR"]:
+                    sev_icon, sev_color = "●", Theme.YELLOW
+                else:
+                    sev_icon, sev_color = "●", Theme.GREEN
                 
-                table.add_row(
-                    timestamp,
-                    event,
-                    f"[{sev_color}]{severity}[/{sev_color}]",
-                    assertion_id
-                )
+                # Extract narrative if available
+                details = entry.get('details', {})
+                if 'narratives' in details and details['narratives']:
+                    narrative_text = details['narratives'][0].get('title', 'Alert')
+                elif 'narrative' in details:
+                    narrative_text = details['narrative'].get('title', 'Alert')
+                else:
+                    narrative_text = entry.get('event_type', 'UNKNOWN')
+                
+                # Truncate narrative
+                narrative_display = narrative_text[:35] + "..." if len(narrative_text) > 35 else narrative_text
+                
+                content.append(f"\n  {sev_icon} ", style=sev_color)
+                content.append(f"{timestamp}", style=Theme.SUBTLE)
+                content.append(f"\n    {narrative_display}\n", style=Theme.WHITE)
         else:
-            table.add_row("", "[dim]No audit log yet[/dim]", "", "")
+            content.append("\n  📋 No audit events yet\n", style=Theme.SUBTLE)
         
-        return Panel(table, border_style="dim", box=box.ROUNDED)
+        return Panel(
+            content,
+            title=f"[bold {Theme.PURPLE}]━━━ 📜 ACTIVITY LOG ━━━[/bold {Theme.PURPLE}]",
+            border_style=Theme.PURPLE,
+            box=box.DOUBLE,
+            padding=(0, 1)
+        )
     
     def _create_layout(self) -> Layout:
-        """Create terminal layout"""
+        """Create stunning terminal layout with themed design"""
         layout = Layout()
         
         layout.split(
-            Layout(name="header", size=5),
+            Layout(name="header", size=15),
             Layout(name="body", ratio=1),
-            Layout(name="footer", size=3)
+            Layout(name="footer", size=4)
         )
         
         layout["body"].split_row(
-            Layout(name="main", ratio=2),
-            Layout(name="sidebar", ratio=1)
+            Layout(name="main", ratio=3),
+            Layout(name="sidebar", ratio=1, minimum_size=35)
         )
         
         layout["main"].split(
-            Layout(name="status", size=6),
-            Layout(name="assertions", ratio=1)
+            Layout(name="status", size=9),
+            Layout(name="assertions", ratio=1, minimum_size=15)
         )
         
         layout["header"].update(self._create_header())
         layout["status"].update(self._create_status_bar())
         layout["assertions"].update(self._create_assertions_table())
         layout["sidebar"].update(self._create_audit_log())
+        
+        # Create themed footer
+        footer_text = Text()
+        footer_text.append("  ⌨ ", style=Theme.CYAN)
+        footer_text.append("Ctrl+C", style=f"bold {Theme.WHITE}")
+        footer_text.append(" to exit  │  ", style=Theme.SUBTLE)
+        footer_text.append("🌐 ", style=Theme.CYAN)
+        footer_text.append(f"http://127.0.0.1:{self._api_port}", style=Theme.LINK)
+        footer_text.append("  │  ", style=Theme.SUBTLE)
+        footer_text.append("📁 ", style=Theme.GREEN)
+        footer_text.append("File changes trigger automatic checks", style=Theme.SUBTLE)
+        
         layout["footer"].update(
             Panel(
-                "[dim]Press Ctrl+C to exit │ File changes trigger automatic governance cycles[/dim]",
-                style="dim"
+                Align.center(footer_text),
+                box=box.SIMPLE,
+                style=f"on black",
+                padding=(0, 0)
             )
         )
         
@@ -313,11 +783,12 @@ class DREMonitor:
         """Execute governance cycle and update UI"""
         try:
             # Load current state
-            ingestor = ExcelIngestor(self.manifest)
+            ingestor = ExcelIngestor(self.manifest, self.manifest_path)
             current_state = ingestor.read_data()
             
             global_halt = False
             report = []
+            conflict_results = []  # Store Gate 3 results
             
             for assertion in self.manifest.assertions:
                 # Run gates
@@ -344,14 +815,26 @@ class DREMonitor:
                 if raw_halt and not is_suppressed:
                     global_halt = True
                     
-                    # Log to audit
+                    # Generate human narratives for all gates
+                    narratives = []
+                    if g1["status"] == "HALT":
+                        narratives.append(self.brain.get_human_narrative("gate_1", g1, assertion.logical_name))
+                    if g2["status"] == "HALT":
+                        narratives.append(self.brain.get_human_narrative("gate_2", g2, assertion.logical_name))
+                    if g4["status"] == "HALT":
+                        narratives.append(self.brain.get_human_narrative("gate_4", g4, assertion.logical_name))
+                    
+                    # Log to audit with both technical and human-friendly data
                     self.audit_logger.log_event(
                         event_type="HALT",
                         assertion_id=assertion.id,
                         details={
-                            "gate_1_freshness": g1,
-                            "gate_2_stability": g2,
-                            "gate_4_structure": g4
+                            "technical": {
+                                "gate_1_freshness": g1,
+                                "gate_2_stability": g2,
+                                "gate_4_structure": g4
+                            },
+                            "narratives": narratives
                         },
                         user=assertion.owner_role,
                         severity="CRITICAL"
@@ -374,6 +857,42 @@ class DREMonitor:
                     "distribution": assertion.distribution.dict()
                 })
             
+            # Gate 3: Convergence Check (Conflict Pair Analysis)
+            if self.manifest.conflict_pairs:
+                for id1, id2 in self.manifest.conflict_pairs:
+                    # Find assertions by ID
+                    assertion1 = next((a for a in self.manifest.assertions if a.id == id1), None)
+                    assertion2 = next((a for a in self.manifest.assertions if a.id == id2), None)
+                    
+                    if assertion1 and assertion2:
+                        g3 = self.brain.gate_3_convergence(assertion1, assertion2)
+                        
+                        # Check for HALT
+                        if g3["status"] == "HALT":
+                            global_halt = True
+                            
+                            # Generate human narrative for conflict
+                            narrative = self.brain.get_human_narrative("gate_3", g3, f"{assertion1.logical_name} vs {assertion2.logical_name}")
+                            
+                            # Log to audit with overlap integral and narrative
+                            self.audit_logger.log_event(
+                                event_type="GATE_3_CONFLICT",
+                                assertion_id=f"{id1}+{id2}",
+                                details={
+                                    "technical": {
+                                        "gate_3_convergence": g3,
+                                        "overlap_integral": g3["overlap_integral"],
+                                        "assertion1": g3["assertion1"],
+                                        "assertion2": g3["assertion2"]
+                                    },
+                                    "narrative": narrative
+                                },
+                                user=f"{assertion1.owner_role}+{assertion2.owner_role}",
+                                severity=g3["severity"]
+                            )
+                        
+                        conflict_results.append(g3)
+            
             # Update state
             self.last_check = datetime.now()
             self.total_checks += 1
@@ -382,43 +901,103 @@ class DREMonitor:
                 self.halt_count += 1
             self.current_assertions = report
             
-            # Push to dashboard if enabled
-            if self.enable_dashboard:
-                try:
-                    # Store state in API for frontend to poll
-                    import api.bridge as bridge_module
-                    from datetime import timezone
+            # Push state to dashboard via shared memory (same process)
+            # This is the "Push" model - no HTTP polling needed
+            try:
+                import guardian.api.bridge as bridge_module
+                import asyncio
+                
+                governance_state = {
+                    "status": self.last_status,
+                    "assertions": report,
+                    "conflict_pair": conflict_results[0] if conflict_results else None,
+                    "last_updated": datetime.now(timezone.utc).isoformat(),
+                    "project_name": self.manifest.project_id,
+                    "total_assertions": len(self.manifest.assertions)
+                }
+                
+                # Update shared state (direct memory access, no HTTP)
+                bridge_module.current_governance_state = governance_state
+                
+                # Push to all WebSocket clients (async broadcast)
+                if bridge_module.manager.active_connections:
+                    try:
+                        loop = asyncio.get_event_loop()
+                        if loop.is_running():
+                            asyncio.ensure_future(bridge_module.manager.broadcast(governance_state))
+                        else:
+                            loop.run_until_complete(bridge_module.manager.broadcast(governance_state))
+                    except RuntimeError:
+                        # No event loop - create one for broadcast
+                        asyncio.run(bridge_module.manager.broadcast(governance_state))
+                
+                logger.debug(f"State pushed to {len(bridge_module.manager.active_connections)} clients")
+                
+            except Exception as e:
+                logger.error(f"Failed to push state: {e}")
+            
+            # Notify system tray on HALT (no browser hijack)
+            if global_halt and hasattr(self, 'tray_icon'):
+                # Generate human-friendly notification message
+                halt_message = None
+                for assertion_report in report:
+                    gate_details = assertion_report.get("gate_details", {})
+                    assertion_name = assertion_report.get("logical_name", "Unknown")
                     
-                    governance_state = {
-                        "status": self.last_status,
-                        "assertions": report,
-                        "conflict_pair": None,
-                        "last_updated": datetime.now(timezone.utc).isoformat()
-                    }
-                    bridge_module.current_governance_state = governance_state
+                    # Check each gate for HALT
+                    for gate_key in ["freshness", "stability", "alignment"]:
+                        if gate_key in gate_details and gate_details[gate_key].get("status") == "HALT":
+                            gate_map = {"freshness": "gate_1", "stability": "gate_2", "alignment": "gate_4"}
+                            narrative = self.brain.get_human_narrative(
+                                gate_map[gate_key],
+                                gate_details[gate_key],
+                                assertion_name
+                            )
+                            halt_message = f"{narrative['title']}: {narrative['message']}"
+                            break
                     
-                    # Only open browser on HALT
-                    if global_halt:
-                        import webbrowser
-                        webbrowser.open("http://localhost:5173")
-                except:
-                    pass
+                    if halt_message:
+                        break
+                
+                # Check conflict results for Gate 3 narratives
+                if not halt_message and conflict_results:
+                    for g3_result in conflict_results:
+                        if g3_result.get("status") == "HALT":
+                            a1_name = g3_result["assertion1"]["logical_name"]
+                            a2_name = g3_result["assertion2"]["logical_name"]
+                            narrative = self.brain.get_human_narrative(
+                                "gate_3",
+                                g3_result,
+                                f"{a1_name} vs {a2_name}"
+                            )
+                            halt_message = f"{narrative['title']}: {narrative['message']}"
+                            break
+                
+                if halt_message and self.tray_icon:
+                    try:
+                        self.tray_icon.notify_halt(halt_message)
+                    except:
+                        pass
         
         except Exception as e:
-            self.last_status = f"ERROR: {str(e)[:30]}"
+            # Show full error message, not truncated
+            error_msg = str(e)
+            self.last_status = f"ERROR: {error_msg}"
+            logger.error(f"Governance cycle failed: {error_msg}", exc_info=True)
     
     def start_monitoring(self, watch_path: str = None):
         """Start live monitoring with file watcher"""
-        # Resolve watch path to absolute project_space directory
+        # Resolve watch path to directory containing manifest
         if watch_path is None:
-            project_root = Path(__file__).parent.parent
-            watch_path = str(project_root / "project_space")
+            # Use the directory where the manifest.json is located
+            manifest_dir = Path(self.manifest_path).parent
+            watch_path = str(manifest_dir)
         
         self.watching_file = f"{watch_path}/{self.manifest.target_file}"
         
         # Register this monitor instance with Bridge for command ingress
         if self.enable_dashboard:
-            import api.bridge as bridge_module
+            import guardian.api.bridge as bridge_module
             bridge_module.monitor_instance = self
         
         # Run initial check
@@ -435,20 +1014,56 @@ class DREMonitor:
         observer.schedule(watcher, path=watch_path, recursive=False)
         observer.start()
         
-        # Live display loop
+        # Display monitoring started confirmation - cleaner output
+        target_filename = Path(self.manifest.target_file).name
+        console.clear()
+        
+        # Print dashboard link prominently if enabled
+        if self.enable_dashboard:
+            console.print()
+            console.print(f"  [bold {Theme.CYAN}]━━━ DASHBOARD ━━━[/bold {Theme.CYAN}]")
+            console.print(f"  [bold {Theme.GREEN}]✓[/bold {Theme.GREEN}] Dashboard running at: [bold underline {Theme.CYAN}]http://127.0.0.1:{self._api_port}[/bold underline {Theme.CYAN}]")
+            console.print()
+        
+        # Static display - print once, update only on state changes
         try:
             last_state = None
-            with Live(self._create_layout(), console=console, refresh_per_second=0.5, screen=True) as live:
-                while True:
-                    # Only update if state changed
-                    current_state = (self.last_status, self.total_checks, self.halt_count, len(self.current_assertions))
-                    if current_state != last_state:
-                        live.update(self._create_layout())
-                        last_state = current_state
-                    time.sleep(2)
+            
+            # Print initial layout
+            console.print(self._create_layout())
+            last_state = (self.last_status, self.total_checks, self.halt_count, len(self.current_assertions))
+            
+            # Monitor loop - only reprint when state actually changes
+            while True:
+                time.sleep(1)
+                current_state = (self.last_status, self.total_checks, self.halt_count, len(self.current_assertions))
+                
+                # Only update display if state actually changed (not time-based)
+                if current_state != last_state:
+                    console.clear()
+                    if self.enable_dashboard:
+                        console.print()
+                        console.print(f"  [bold {Theme.CYAN}]━━━ DASHBOARD ━━━[/bold {Theme.CYAN}]")
+                        console.print(f"  [bold {Theme.GREEN}]✓[/bold {Theme.GREEN}] Dashboard running at: [bold underline {Theme.CYAN}]http://127.0.0.1:{self._api_port}[/bold underline {Theme.CYAN}]")
+                        console.print()
+                    console.print(self._create_layout())
+                    last_state = current_state
+                    
         except KeyboardInterrupt:
             observer.stop()
             observer.join()
+            
+            # Cleanup uvicorn subprocess
+            if self._api_process:
+                try:
+                    if sys.platform == "win32":
+                        subprocess.run(["taskkill", "/F", "/T", "/PID", str(self._api_process.pid)],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    else:
+                        self._api_process.terminate()
+                        self._api_process.wait(timeout=2)
+                except:
+                    pass
             
             # Cleanup frontend process
             if self._frontend_process:
@@ -462,7 +1077,7 @@ class DREMonitor:
                 except:
                     pass
             
-            console.print("\n[yellow]⚡ Guardian stopped[/yellow]")
+            console.print("\n[green]✓ Monitoring stopped gracefully[/green]")
 
 
 if __name__ == "__main__":
@@ -470,24 +1085,71 @@ if __name__ == "__main__":
     
     # Parse args
     enable_dashboard = "--dashboard" in sys.argv or "-d" in sys.argv
-    manifest_path = "../project_space/manifest.json"
     
-    # Banner
-    console.print("\n[bold cyan]═══════════════════════════════════════════════════[/bold cyan]")
-    console.print("[bold yellow]⚡ DRE GUARDIAN[/bold yellow] [dim]- Data Reliability Engine[/dim]")
-    console.print("[bold cyan]═══════════════════════════════════════════════════[/bold cyan]\n")
+    try:
+        # Initialize config
+        config = get_config()
+        manifest_path = str(config.manifest_path)
+    except Exception as e:
+        error_msg = f"Failed to initialize: {e}\\n\\nPlease ensure manifest.json exists in project_space/"
+        
+        # Show message box on Windows if running as frozen executable
+        if getattr(sys, 'frozen', False) and sys.platform == 'win32':
+            try:
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(0, error_msg, "DRE Guardian - Initialization Error", 0x10)
+            except:
+                pass
+        
+        console.print(f"[{Theme.RED}]✗ Error:[/{Theme.RED}] {error_msg}")
+        sys.exit(1)
+    
+    # Startup Banner - themed to match the CLI
+    console.clear()
+    startup_text = Text()
+    startup_text.append("\n")
+    startup_text.append("  ╔═══════════════════════════════════════════════════════════════╗\n", style=Theme.CYAN)
+    startup_text.append("  ║                                                               ║\n", style=Theme.CYAN)
+    startup_text.append("  ║   ", style=Theme.CYAN)
+    startup_text.append("⚡ DRE GUARDIAN", style=f"bold {Theme.WHITE}")
+    startup_text.append(" - Data Reliability Engine", style=Theme.SUBTLE)
+    startup_text.append("         ║\n", style=Theme.CYAN)
+    startup_text.append("  ║                                                               ║\n", style=Theme.CYAN)
+    startup_text.append("  ╚═══════════════════════════════════════════════════════════════╝\n", style=Theme.CYAN)
+    console.print(startup_text)
     
     if enable_dashboard:
-        console.print("[green]✓[/green] Dashboard enabled: [blue underline]http://localhost:5173[/blue underline]")
+        console.print(f"  [{Theme.GREEN}]✓[/{Theme.GREEN}] Dashboard will be served on port 8000-8002")
+        console.print(f"  [{Theme.YELLOW}]ℹ[/{Theme.YELLOW}] Dashboard does not auto-open. Access from the monitor display.\n")
     
-    console.print("[dim]Loading manifest...[/dim]\n")
+    console.print(f"  [{Theme.SUBTLE}]Loading manifest...[/{Theme.SUBTLE}]\n")
     
     try:
         monitor = DREMonitor(manifest_path, enable_dashboard=enable_dashboard)
         monitor.start_monitoring()
-    except FileNotFoundError:
-        console.print("[red]✗ Manifest not found. Run:[/red] [cyan]dre init[/cyan]")
+    except FileNotFoundError as e:
+        error_msg = f"Manifest not found: {e}\\n\\nRun 'dre init' to create a new project."
+        
+        if getattr(sys, 'frozen', False) and sys.platform == 'win32':
+            try:
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(0, error_msg, "DRE Guardian - File Not Found", 0x10)
+            except:
+                pass
+        
+        console.print(f"[{Theme.RED}]✗ Manifest not found. Run:[/{Theme.RED}] [{Theme.CYAN}]dre init[/{Theme.CYAN}]")
         sys.exit(1)
     except Exception as e:
-        console.print(f"[red]✗ Error:[/red] {e}")
+        error_msg = f"Monitor startup failed: {e}"
+        
+        if getattr(sys, 'frozen', False) and sys.platform == 'win32':
+            try:
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(0, error_msg, "DRE Guardian Error", 0x10)
+            except:
+                pass
+        
+        console.print(f"[{Theme.RED}]✗ Error:[/{Theme.RED}] {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)

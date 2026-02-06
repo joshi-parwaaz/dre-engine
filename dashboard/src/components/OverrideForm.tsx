@@ -16,7 +16,15 @@ const OverrideForm = ({ assertionIds }: Props) => {
     setResult(null)
 
     try {
-      const response = await fetch('http://127.0.0.1:8000/override', {
+      const timestamp = new Date().toISOString()
+      
+      // Compute SHA-256 hash for non-repudiation (matching bypass modal logic)
+      const hashInput = `${justification}|${signature}|${timestamp}`
+      const hashBuffer = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(hashInput))
+      const hashArray = Array.from(new Uint8Array(hashBuffer))
+      const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('')
+
+      const response = await fetch('/override', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -25,18 +33,19 @@ const OverrideForm = ({ assertionIds }: Props) => {
           assertion_ids: assertionIds,
           justification,
           signature,
-          timestamp: new Date().toISOString(),
+          timestamp,
+          signature_hash: hashHex
         }),
       })
 
       const data = await response.json()
 
       if (response.ok) {
-        setResult('Override request recorded and pending evaluation.')
+        setResult(`Override request recorded successfully.\n\nDigital Hash: ${hashHex.substring(0, 16)}...\n\nThis override has been logged in the audit trail.`)
         setJustification('')
         setSignature('')
       } else {
-        setResult(`Override rejected: ${data.detail || 'Unknown error'}`)
+        setResult(`Override rejected: ${data.message || data.detail || 'Unknown error'}`)
       }
     } catch (error) {
       setResult(`Failed to submit override: ${error}`)

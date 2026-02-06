@@ -4,25 +4,103 @@ FastAPI server that connects the Brain to the UI via WebSocket
 """
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 import logging
 import asyncio
+import json
 from datetime import datetime
 from .audit_logger import AuditLogger
+from guardian.core.config import get_config
 
 logger = logging.getLogger("DRE_Bridge")
 
 app = FastAPI(title="DRE Guardian API")
 
-# CORS for local development
+# CORS for production static dashboard
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["http://127.0.0.1:8000", "http://localhost:8000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Mount static assets FIRST - before any route definitions
+# This ensures /assets/* is handled before any catch-all routes
+import sys
+from pathlib import Path
+
+class PathManager:
+    """
+    Virtual File System resolver for frozen-aware asset routing.
+    
+    Handles path resolution differences between:
+    - Frozen mode (PyInstaller): Assets in sys._MEIPASS
+    - Development mode: Assets in ../dashboard/dist
+    """
+    
+    _instance = None
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+    
+    def __init__(self):
+        if self._initialized:
+            return
+        
+        self.is_frozen = getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS')
+        self._meipass = getattr(sys, '_MEIPASS', None) if self.is_frozen else None
+        self._initialized = True
+        
+        logger.info(f"PathManager: frozen={self.is_frozen}, _MEIPASS={self._meipass}")
+    
+    @property
+    def dashboard_dist(self) -> Path:
+        """Get dashboard dist directory path"""
+        if self.is_frozen:
+            return Path(self._meipass) / "dashboard" / "dist"
+        else:
+            bundle_dir = Path(__file__).resolve().parent.parent
+            app_dir = bundle_dir.parent
+            return app_dir / "dashboard" / "dist"
+    
+    @property
+    def dashboard_assets(self) -> Path:
+        """Get dashboard assets directory path"""
+        return self.dashboard_dist / "assets"
+    
+    @property
+    def dashboard_index(self) -> Path:
+        """Get dashboard index.html path"""
+        return self.dashboard_dist / "index.html"
+    
+    def exists(self) -> bool:
+        """Check if dashboard files exist"""
+        return self.dashboard_index.exists()
+
+# Initialize path manager
+path_manager = PathManager()
+
+def _get_dashboard_dist():
+    """Get dashboard dist path - uses PathManager"""
+    return path_manager.dashboard_dist
+
+def _get_dashboard_assets():
+    """Get dashboard assets path for mounting"""
+    return path_manager.dashboard_assets
+
+_assets_dir = _get_dashboard_assets()
+if _assets_dir.exists():
+    app.mount("/assets", StaticFiles(directory=str(_assets_dir), html=False), name="assets")
+    logger.info(f"✓ Dashboard assets mounted from {_assets_dir}")
+else:
+    logger.warning(f"✗ Assets not found at {_assets_dir}")
 
 # Active WebSocket connections
 class ConnectionManager:
@@ -48,7 +126,12 @@ class ConnectionManager:
                 logger.error(f"Failed to send to WebSocket: {e}")
 
 manager = ConnectionManager()
-audit_logger = AuditLogger("../project_space/audit_log.jsonl")
+
+# Lazy initialization helpers
+def get_audit_logger():
+    """Get audit logger - called at runtime, not module load time"""
+    config = get_config()
+    return AuditLogger(str(config.audit_log_path))
 
 # Models
 class OverrideRequest(BaseModel):
@@ -126,6 +209,7 @@ async def submit_override(request: OverrideRequest):
         raise
     
     # Log to audit trail after successful registration
+    audit_logger = get_audit_logger()
     for assertion_id in request.assertion_ids:
         audit_logger.log_event(
             event_type="OVERRIDE_REQUEST",
@@ -154,14 +238,13 @@ async def get_recent_audit(limit: int = 50, offset: int = 0):
     Scope: Last 24 hours or current session
     Purpose: Show active delta since last model open
     """
-    from pathlib import Path
-    # Get absolute path relative to this file
-    log_path = Path(__file__).parent.parent.parent / "project_space" / "audit_log.jsonl"
+    config = get_config()
+    log_path = config.audit_log_path
     
-    print(f"🔍 Checking audit log at: {log_path}")
+    logger.debug(f"Checking audit log at: {log_path}")
     
     if not log_path.exists():
-        print(f"⚠️ Audit log not found at {log_path}")
+        logger.warning(f"Audit log not found at {log_path}")
         return {"events": [], "total": 0}
     
     # Read all events
@@ -173,7 +256,7 @@ async def get_recent_audit(limit: int = 50, offset: int = 0):
             except json.JSONDecodeError:
                 continue
     
-    print(f"📊 Read {len(events)} total events from audit log")
+    logger.debug(f"Read {len(events)} total events from audit log")
     
     # Filter: last 24 hours
     from datetime import datetime, timedelta, timezone
@@ -186,11 +269,11 @@ async def get_recent_audit(limit: int = 50, offset: int = 0):
             if event_time > cutoff:
                 recent.append(e)
         except (ValueError, KeyError) as err:
-            print(f"⚠️ Failed to parse timestamp: {e.get('timestamp', 'missing')} - {err}")
+            logger.warning(f"Failed to parse timestamp: {e.get('timestamp', 'missing')} - {err}")
             # Include it anyway if timestamp parsing fails
             recent.append(e)
     
-    print(f"📊 {len(recent)} events in last 24 hours")
+    logger.debug(f"{len(recent)} events in last 24 hours")
     
     # Sort by timestamp - newest first (reverse chronological)
     recent.sort(key=lambda e: e["timestamp"], reverse=True)
@@ -211,7 +294,8 @@ async def get_audit_summary():
     State Checkpointing: Returns aggregated metrics
     Purpose: "3 Stability Breaches in the last 10 saves"
     """
-    log_path = Path("../project_space/audit_log.jsonl")
+    config = get_config()
+    log_path = config.audit_log_path
     
     if not log_path.exists():
         return {
@@ -280,6 +364,14 @@ async def trigger_halt_ui(governance_state: Dict[str, Any]):
     logger.critical("HALT state pushed to UI")
 
 # Get current governance state (for polling)
+@app.post("/api/governance/state")
+async def update_governance_state(state: dict):
+    """Update governance state from monitor"""
+    global current_governance_state
+    current_governance_state = state
+    await manager.broadcast(state)
+    return {"status": "updated"}
+
 @app.get("/api/governance/state")
 async def get_governance_state():
     """Returns the current governance state"""
@@ -295,6 +387,23 @@ async def health_check():
         "connections": len(manager.active_connections),
         "timestamp": datetime.now().isoformat()
     }
+
+# Serve index.html for root
+@app.get("/")
+async def root():
+    """Serve dashboard index.html"""
+    dashboard_dist = _get_dashboard_dist()
+    index_file = dashboard_dist / "index.html"
+    if index_file.exists():
+        return FileResponse(
+            str(index_file),
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0"
+            }
+        )
+    return {"error": "Dashboard not built", "path": str(index_file)}, 503
 
 if __name__ == "__main__":
     import uvicorn

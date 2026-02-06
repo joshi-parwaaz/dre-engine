@@ -24,7 +24,6 @@ Thumbs.db
 
 # Logs
 *.log
-logs/
 
 # Excel temp files
 ~$*.xlsx
@@ -34,6 +33,8 @@ logs/
 build/
 dist/
 *.egg-info/
+*.manifest
+*.spec.bak
 
 # Dashboard
 dashboard/node_modules/
@@ -45,6 +46,12 @@ dashboard/.vite/
 .coverage
 htmlcov/
 
-# Project specific
+# DRE runtime config
+.dre/
+
+# Project space runtime data (user-specific)
+project_space/audit_log.jsonl
+project_space/logs/
+project_space/archives/
 project_space/*.xlsx
-!project_space/model.xlsx
+!project_space/manifest.json

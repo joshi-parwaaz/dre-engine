@@ -44,6 +44,86 @@ interface GovernanceState {
   last_updated?: string
 }
 
+// Human-friendly narrative generator (mirrors brain.py logic)
+function getHumanNarrative(gate: string, gateDetails: GateDetails, assertionName: string): { title: string, message: string, action: string } {
+  const status = gateDetails.status;
+  
+  // Handle SKIP - checks that aren't configured
+  if (status === 'SKIP') {
+    if (gate === 'alignment') {
+      return {
+        title: '⚙️ Not Configured',
+        message: 'Formula integrity tracking is not enabled for this cell.',
+        action: 'To enable: Add formula_hash to the manifest binding configuration.'
+      };
+    }
+    return {
+      title: '⚙️ Check Disabled',
+      message: `${gate} check is not configured for this assertion.`,
+      action: 'Review manifest configuration to enable this check.'
+    };
+  }
+  
+  if (status === 'PASS') {
+    return {
+      title: '✓ All Clear',
+      message: `${assertionName} is within acceptable parameters.`,
+      action: 'No action required.'
+    };
+  }
+  
+  // Gate 1: Freshness → Stale Anchor
+  if (gate === 'freshness') {
+    const days = gateDetails.days_since_update || 0;
+    const sla = gateDetails.sla_days || 0;
+    const owner = gateDetails.owner || 'Unknown';
+    
+    return {
+      title: '⏰ Stale Data Alert',
+      message: `${owner} has not updated '${assertionName}' in ${days} days (SLA: ${sla} days).`,
+      action: `Request ${owner} to refresh this data anchor immediately.`
+    };
+  }
+  
+  // Gate 2: Stability → Volatility Alert
+  if (gate === 'stability') {
+    const current = gateDetails.current_value || 0;
+    const dist = gateDetails.distribution || {};
+    const pdfRatio = gateDetails.pdf_ratio_to_mode || 0;
+    
+    // Check if value is outside range
+    if (gateDetails.reason && gateDetails.reason.toLowerCase().includes('outside')) {
+      return {
+        title: '🚨 Critical Volatility',
+        message: `'${assertionName}' shows value ${current.toFixed(2)}, which falls completely outside the established range [${dist.min?.toFixed(2)} - ${dist.max?.toFixed(2)}].`,
+        action: 'Investigate source data immediately. This may indicate data corruption or fundamental business shift.'
+      };
+    } else {
+      return {
+        title: '📊 Volatility Alert',
+        message: `'${assertionName}' current value (${current.toFixed(2)}) deviates significantly from baseline expectations (confidence: ${(pdfRatio * 100).toFixed(1)}%).`,
+        action: 'Review recent changes and validate whether this shift is intentional.'
+      };
+    }
+  }
+  
+  // Gate 4: Structure → Integrity Alert
+  if (gate === 'alignment') {
+    return {
+      title: '🔒 Formula Integrity Breach',
+      message: `The calculation logic for '${assertionName}' has been modified unexpectedly.`,
+      action: 'Review cell formula and audit trail. Verify change authorization.'
+    };
+  }
+  
+  // Fallback
+  return {
+    title: '❓ Unknown Alert',
+    message: `'${assertionName}' triggered alert: ${status}`,
+    action: 'Contact system administrator.'
+  };
+}
+
 function App() {
   const [state, setState] = useState<GovernanceState | null>(null)
   const [connected, setConnected] = useState(false)
@@ -53,15 +133,17 @@ function App() {
   const [showBypassModal, setShowBypassModal] = useState(false)
   const [bypassJustification, setBypassJustification] = useState('')
   const [bypassSignature, setBypassSignature] = useState('')
+  const [selectedAssertion, setSelectedAssertion] = useState<Assertion | null>(null)
+
+  console.log('[DEBUG] Render - leadershipMode:', leadershipMode, 'state:', state, 'connected:', connected)
 
   useEffect(() => {
-    // Poll for governance state every 2 seconds
     const pollState = async () => {
       try {
-        const response = await fetch('http://localhost:8000/api/governance/state')
+        const response = await fetch('/api/governance/state')
         const data = await response.json()
-        if (data.assertions && data.assertions.length > 0) {
-          // Only update state if data actually changed
+        if (data.assertions !== undefined) {
+          // Update state even if assertions array is empty
           setState(prevState => {
             const dataStr = JSON.stringify(data)
             const prevStr = JSON.stringify(prevState)
@@ -245,7 +327,10 @@ function App() {
               Active. Listening for governance events.
             </p>
             <button
-              onClick={() => setLeadershipMode(true)}
+              onClick={() => {
+                console.log('[DEBUG] Leadership button clicked!')
+                setLeadershipMode(true)
+              }}
               style={{
                 background: 'transparent',
                 border: '1px solid rgba(59, 130, 246, 0.3)',
@@ -271,8 +356,8 @@ function App() {
     Object.values(a.gate_status).includes('HALT')
   )
 
-  // Default to Leadership Dashboard when state exists
-  if (leadershipMode || state.status !== 'HALT') {
+  // Show Leadership Dashboard when explicitly selected
+  if (leadershipMode) {
     return (
       <div style={{ position: 'relative', minHeight: '100vh', overflow: 'auto', background: '#0a0e1a' }}>
         <div style={{ position: 'fixed', inset: 0, zIndex: 0 }}>
@@ -361,27 +446,26 @@ function App() {
                   HALT
                 </div>
               )}
+              <button
+                onClick={() => setLeadershipMode(false)}
+                style={{
+                  background: state.status === 'HALT' ? 'rgba(239, 68, 68, 0.15)' : 'rgba(100, 116, 139, 0.15)',
+                  border: state.status === 'HALT' ? '1px solid rgba(239, 68, 68, 0.4)' : '1px solid rgba(100, 116, 139, 0.3)',
+                  color: state.status === 'HALT' ? '#ef4444' : '#94a3b8',
+                  padding: '0.75rem 1.5rem',
+                  borderRadius: '6px',
+                  cursor: 'pointer',
+                  fontSize: '0.9rem',
+                  fontWeight: '400',
+                  transition: 'all 0.2s',
+                  letterSpacing: '0.3px'
+                }}
+              >
+                {state.status === 'HALT' ? 'View HALT Details' : 'HALT View'}
+              </button>
               {state.status === 'HALT' && (
-                <>
-                  <button
-                    onClick={() => setLeadershipMode(false)}
-                    style={{
-                      background: 'rgba(239, 68, 68, 0.15)',
-                      border: '1px solid rgba(239, 68, 68, 0.4)',
-                      color: '#ef4444',
-                      padding: '0.75rem 1.5rem',
-                      borderRadius: '6px',
-                      cursor: 'pointer',
-                      fontSize: '0.9rem',
-                      fontWeight: '400',
-                      transition: 'all 0.2s',
-                      letterSpacing: '0.3px'
-                    }}
-                  >
-                    View HALT Details
-                  </button>
-                  <button
-                    onClick={() => setShowBypassModal(true)}
+                <button
+                  onClick={() => setShowBypassModal(true)}
                     style={{
                       background: 'rgba(245, 158, 11, 0.15)',
                       border: '1px solid rgba(245, 158, 11, 0.4)',
@@ -394,10 +478,9 @@ function App() {
                       transition: 'all 0.2s',
                       letterSpacing: '0.3px'
                     }}
-                  >
-                    Bypass HALT
-                  </button>
-                </>
+                >
+                  Bypass HALT
+                </button>
               )}
               <button
                 onClick={() => setShowAuditLog(!showAuditLog)}
@@ -506,7 +589,10 @@ function App() {
                 <span>Audit Log</span>
               </button>
               <button
-                onClick={() => setLeadershipMode(true)}
+                onClick={() => {
+                  console.log('[DEBUG] Leadership button (main view) clicked!')
+                  setLeadershipMode(true)
+                }}
                 style={{
                   background: 'rgba(59, 130, 246, 0.2)',
                   border: '1px solid rgba(59, 130, 246, 0.4)',
@@ -567,19 +653,40 @@ function App() {
             Gate Analysis Results
           </h2>
           
-          <div style={{ display: 'grid', gap: '2rem', pointerEvents: 'auto' }}>
-            {haltedAssertions.map((assertion, idx) => (
+          {haltedAssertions.length === 0 ? (
+            <div style={{
+              padding: '3rem',
+              textAlign: 'center',
+              background: 'rgba(16, 185, 129, 0.1)',
+              border: '1px solid rgba(16, 185, 129, 0.2)',
+              borderRadius: '12px'
+            }}>
+              <div style={{ fontSize: '3rem', marginBottom: '1rem' }}>✓</div>
+              <h3 style={{ fontSize: '1.5rem', color: '#10b981', marginBottom: '0.5rem', fontWeight: '500' }}>
+                No Active HALTs
+              </h3>
+              <p style={{ color: 'var(--text-secondary)', fontSize: '1rem' }}>
+                All governance gates are currently passing or bypassed.
+              </p>
+            </div>
+          ) : (
+            <div style={{ display: 'grid', gap: '2rem', pointerEvents: 'auto' }}>
+              {haltedAssertions.map((assertion, idx) => (
               <div 
                 key={assertion.id} 
                 className="fade-in" 
+                onClick={() => setSelectedAssertion(assertion)}
                 style={{ 
                   border: '1px solid rgba(100, 116, 139, 0.15)',
                   borderRadius: '8px',
                   padding: '2rem',
                   transition: 'all 0.3s ease',
                   animationDelay: `${idx * 0.1}s`,
-                  background: 'rgba(15, 23, 42, 0.2)'
+                  background: 'rgba(15, 23, 42, 0.2)',
+                  cursor: 'pointer'
                 }}
+                onMouseEnter={(e) => e.currentTarget.style.borderColor = 'rgba(100, 116, 139, 0.3)'}
+                onMouseLeave={(e) => e.currentTarget.style.borderColor = 'rgba(100, 116, 139, 0.15)'}
               >
                 <div style={{ 
                   display: 'flex', 
@@ -616,56 +723,75 @@ function App() {
                   marginBottom: '1.5rem'
                 }}>
                   {Object.entries(assertion.gate_status).map(([gate, status]) => {
-                    const gateLabel = gate === 'freshness' ? 'Freshness' : gate === 'stability' ? 'Stability' : 'Structure';
+                    const gateLabel = gate === 'freshness' ? 'Data Freshness' : gate === 'stability' ? 'Value Stability' : 'Formula Integrity';
                     const isHalt = status === 'HALT';
+                    const isSkip = status === 'SKIP';
                     const gateDetails = assertion.gate_details?.[gate as keyof typeof assertion.gate_details];
+                    
+                    // Generate human narrative
+                    const narrative = gateDetails 
+                      ? getHumanNarrative(gate, gateDetails, assertion.logical_name)
+                      : null;
+                    
+                    // Color coding
+                    const bgColor = isHalt ? 'rgba(239, 68, 68, 0.1)' : isSkip ? 'rgba(100, 116, 139, 0.05)' : 'rgba(16, 185, 129, 0.1)';
+                    const borderColor = isHalt ? 'rgba(239, 68, 68, 0.3)' : isSkip ? 'rgba(100, 116, 139, 0.2)' : 'rgba(16, 185, 129, 0.2)';
+                    const statusColor = isHalt ? '#ef4444' : isSkip ? '#94a3b8' : '#10b981';
                     
                     return (
                       <div key={gate} style={{ 
                         display: 'flex', 
                         flexDirection: 'column',
-                        padding: '0.75rem 1rem',
-                        background: 'rgba(15, 23, 42, 0.3)',
-                        border: `1px solid ${isHalt ? 'rgba(239, 68, 68, 0.3)' : 'rgba(16, 185, 129, 0.2)'}`,
-                        borderRadius: '6px'
+                        padding: '1rem',
+                        background: bgColor,
+                        border: `1px solid ${borderColor}`,
+                        borderRadius: '8px'
                       }}>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                          <span style={{ color: 'var(--text-secondary)', fontSize: '0.9rem', fontWeight: '400', letterSpacing: '0.3px' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: narrative ? '0.75rem' : '0' }}>
+                          <span style={{ color: 'var(--text-primary)', fontSize: '0.95rem', fontWeight: '500', letterSpacing: '0.3px' }}>
                             {gateLabel}
                           </span>
                           <span style={{
                             fontSize: '0.85rem',
                             fontWeight: '500',
-                            color: isHalt ? '#ef4444' : '#10b981',
+                            color: statusColor,
                             letterSpacing: '0.5px'
                           }}>
                             {status}
                           </span>
                         </div>
-                        {isHalt && gateDetails && (
+                        
+                        {narrative && (
                           <div style={{ 
-                            marginTop: '0.5rem', 
-                            fontSize: '0.85rem', 
-                            color: 'var(--text-secondary)',
-                            fontWeight: '300',
-                            letterSpacing: '0.2px'
+                            display: 'flex',
+                            flexDirection: 'column',
+                            gap: '0.5rem'
                           }}>
-                            {gate === 'stability' && gateDetails.drift && (
-                              <span>
-                                Drift: {(gateDetails.drift * 100).toFixed(1)}% (threshold: {(gateDetails.threshold * 100).toFixed(0)}%)
-                                {gateDetails.current_value !== undefined && gateDetails.baseline_value !== undefined && (
-                                  <> • Current: {gateDetails.current_value}, Baseline: {gateDetails.baseline_value}</>
-                                )}
-                              </span>
-                            )}
-                            {gate === 'freshness' && gateDetails.days_since_update !== undefined && (
-                              <span>
-                                Last updated {gateDetails.days_since_update} days ago (SLA: {gateDetails.sla_days} days)
-                              </span>
-                            )}
-                            {gate === 'alignment' && gateDetails.reason && (
-                              <span>{gateDetails.reason}</span>
-                            )}
+                            <div style={{
+                              fontSize: '0.9rem',
+                              color: 'var(--text-primary)',
+                              fontWeight: '500',
+                              letterSpacing: '0.2px'
+                            }}>
+                              {narrative.title}
+                            </div>
+                            <div style={{
+                              fontSize: '0.85rem',
+                              color: 'var(--text-secondary)',
+                              lineHeight: '1.5',
+                              letterSpacing: '0.2px'
+                            }}>
+                              {narrative.message}
+                            </div>
+                            <div style={{
+                              fontSize: '0.85rem',
+                              color: '#60a5fa',
+                              fontWeight: '500',
+                              marginTop: '0.25rem',
+                              letterSpacing: '0.2px'
+                            }}>
+                              → {narrative.action}
+                            </div>
                           </div>
                         )}
                       </div>
@@ -680,7 +806,8 @@ function App() {
                 )}
               </div>
             ))}
-          </div>
+            </div>
+          )}
         </div>
 
         <div style={{ animationDelay: '0.5s', pointerEvents: 'auto' }} className="fade-in">
@@ -689,6 +816,230 @@ function App() {
       </div>
 
       {showAuditLog && <AuditLog onClose={() => setShowAuditLog(false)} />}
+
+      {/* Detailed Assertion Modal */}
+      {selectedAssertion && (
+        <div style={{
+          position: 'fixed',
+          inset: 0,
+          background: 'rgba(0, 0, 0, 0.85)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          zIndex: 1000,
+          backdropFilter: 'blur(6px)',
+          padding: '2rem'
+        }}>
+          <div style={{
+            background: 'var(--panel-bg)',
+            border: '1px solid rgba(100, 116, 139, 0.3)',
+            borderRadius: '12px',
+            padding: '2.5rem',
+            maxWidth: '800px',
+            width: '100%',
+            maxHeight: '90vh',
+            overflowY: 'auto',
+            boxShadow: '0 20px 60px rgba(0, 0, 0, 0.6)'
+          }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '1.5rem' }}>
+              <div>
+                <h2 style={{
+                  fontSize: '1.75rem',
+                  fontWeight: '600',
+                  color: 'var(--text-primary)',
+                  marginBottom: '0.5rem'
+                }}>{selectedAssertion.logical_name}</h2>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' }}>
+                  <code style={{
+                    fontSize: '0.8rem',
+                    color: 'var(--text-muted)',
+                    background: 'rgba(100, 116, 139, 0.15)',
+                    padding: '0.25rem 0.75rem',
+                    borderRadius: '6px',
+                    fontFamily: 'monospace'
+                  }}>
+                    {selectedAssertion.id}
+                  </code>
+                  <span style={{
+                    fontSize: '0.85rem',
+                    color: 'var(--text-secondary)'
+                  }}>
+                    👤 {selectedAssertion.owner_role}
+                  </span>
+                </div>
+              </div>
+              <button
+                onClick={() => setSelectedAssertion(null)}
+                style={{
+                  background: 'transparent',
+                  border: 'none',
+                  color: 'var(--text-muted)',
+                  fontSize: '1.5rem',
+                  cursor: 'pointer',
+                  padding: '0.25rem 0.5rem',
+                  lineHeight: 1
+                }}
+              >
+                ✕
+              </button>
+            </div>
+
+            <div style={{ marginBottom: '2rem' }}>
+              <h3 style={{
+                fontSize: '1.1rem',
+                fontWeight: '600',
+                color: 'var(--text-primary)',
+                marginBottom: '1rem'
+              }}>Gate Analysis Results</h3>
+              
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                {Object.entries(selectedAssertion.gate_status).map(([gate, status]) => {
+                  const gateLabel = gate === 'freshness' ? 'Data Freshness' : gate === 'stability' ? 'Value Stability' : 'Formula Integrity';
+                  const isHalt = status === 'HALT';
+                  const isSkip = status === 'SKIP';
+                  const gateDetails = selectedAssertion.gate_details?.[gate as keyof typeof selectedAssertion.gate_details];
+                  
+                  const narrative = gateDetails 
+                    ? getHumanNarrative(gate, gateDetails, selectedAssertion.logical_name)
+                    : null;
+                  
+                  const bgColor = isHalt ? 'rgba(239, 68, 68, 0.1)' : isSkip ? 'rgba(100, 116, 139, 0.05)' : 'rgba(16, 185, 129, 0.1)';
+                  const borderColor = isHalt ? 'rgba(239, 68, 68, 0.3)' : isSkip ? 'rgba(100, 116, 139, 0.2)' : 'rgba(16, 185, 129, 0.2)';
+                  const statusColor = isHalt ? '#ef4444' : isSkip ? '#94a3b8' : '#10b981';
+                  
+                  return (
+                    <div key={gate} style={{
+                      padding: '1.25rem',
+                      background: bgColor,
+                      border: `1px solid ${borderColor}`,
+                      borderRadius: '8px'
+                    }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+                        <span style={{ color: 'var(--text-primary)', fontSize: '1rem', fontWeight: '600' }}>
+                          {gateLabel}
+                        </span>
+                        <span style={{
+                          fontSize: '0.9rem',
+                          fontWeight: '600',
+                          color: statusColor,
+                          letterSpacing: '0.5px'
+                        }}>
+                          {status}
+                        </span>
+                      </div>
+                      
+                      {narrative && (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+                          <div style={{
+                            fontSize: '1rem',
+                            color: 'var(--text-primary)',
+                            fontWeight: '500'
+                          }}>
+                            {narrative.title}
+                          </div>
+                          <div style={{
+                            fontSize: '0.9rem',
+                            color: 'var(--text-secondary)',
+                            lineHeight: '1.6'
+                          }}>
+                            {narrative.message}
+                          </div>
+                          <div style={{
+                            fontSize: '0.9rem',
+                            color: '#60a5fa',
+                            fontWeight: '500',
+                            marginTop: '0.25rem'
+                          }}>
+                            → {narrative.action}
+                          </div>
+                        </div>
+                      )}
+                      
+                      {gateDetails && status === 'HALT' && (
+                        <details style={{ marginTop: '1rem' }}>
+                          <summary style={{
+                            cursor: 'pointer',
+                            color: 'var(--text-muted)',
+                            fontSize: '0.85rem',
+                            userSelect: 'none'
+                          }}>Show technical details</summary>
+                          <pre style={{
+                            marginTop: '0.75rem',
+                            padding: '0.75rem',
+                            background: 'rgba(0, 0, 0, 0.3)',
+                            borderRadius: '4px',
+                            fontSize: '0.75rem',
+                            color: 'var(--text-muted)',
+                            overflow: 'auto',
+                            fontFamily: 'monospace'
+                          }}>
+                            {JSON.stringify(gateDetails, null, 2)}
+                          </pre>
+                        </details>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {selectedAssertion.distribution && (
+              <div style={{ marginBottom: '2rem' }}>
+                <h3 style={{
+                  fontSize: '1.1rem',
+                  fontWeight: '600',
+                  color: 'var(--text-primary)',
+                  marginBottom: '1rem'
+                }}>Distribution Analysis</h3>
+                <PertOverlapChart distribution={selectedAssertion.distribution} />
+              </div>
+            )}
+
+            <div style={{
+              display: 'flex',
+              gap: '1rem',
+              paddingTop: '1.5rem',
+              borderTop: '1px solid rgba(100, 116, 139, 0.2)'
+            }}>
+              <button
+                onClick={() => setSelectedAssertion(null)}
+                style={{
+                  flex: 1,
+                  padding: '0.75rem 1.5rem',
+                  background: 'transparent',
+                  border: '1px solid rgba(100, 116, 139, 0.3)',
+                  color: 'var(--text-muted)',
+                  borderRadius: '6px',
+                  cursor: 'pointer',
+                  fontSize: '0.95rem',
+                  fontWeight: '500'
+                }}
+              >
+                Close
+              </button>
+              <button
+                onClick={() => {
+                  setSelectedAssertion(null);
+                  setShowBypassModal(true);
+                }}
+                style={{
+                  flex: 1,
+                  padding: '0.75rem 1.5rem',
+                  background: 'rgba(245, 158, 11, 0.15)',
+                  border: '1px solid rgba(245, 158, 11, 0.4)',
+                  color: '#f59e0b',
+                  borderRadius: '6px',
+                  cursor: 'pointer',
+                  fontSize: '0.95rem',
+                  fontWeight: '500'
+                }}
+              >
+                Proceed to Bypass
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Bypass Modal - Digital Signature Required */}
       {showBypassModal && (
@@ -842,7 +1193,7 @@ function App() {
                       )
                       .map((a: any) => a.id) || []
 
-                    const response = await fetch('http://localhost:8000/override', {
+                    const response = await fetch('/override', {
                       method: 'POST',
                       headers: { 'Content-Type': 'application/json' },
                       body: JSON.stringify({

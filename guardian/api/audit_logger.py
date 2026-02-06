@@ -1,14 +1,23 @@
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Optional
 
 # Professional audit severity levels (INFO < WARN < CRITICAL)
 SeverityLevel = Literal["INFO", "WARN", "CRITICAL"]
 
 class AuditLogger:
-    def __init__(self, log_path: str = "../project_space/audit_log.jsonl"):
-        self.log_path = Path(log_path)
+    def __init__(self, log_path: Optional[Path] = None):
+        """Initialize audit logger with optional path override"""
+        if log_path is None:
+            from guardian.core.config import get_config
+            config = get_config()
+            self.log_path = config.audit_log_path
+        else:
+            self.log_path = Path(log_path) if isinstance(log_path, str) else log_path
+        
+        # Ensure parent directory exists
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self.session_id = self._generate_session_id()
 
     def _generate_session_id(self) -> str:
@@ -44,7 +53,7 @@ class AuditLogger:
         }
         
         # Append-only mode for data integrity
-        with open(self.log_path, "a", encoding="utf-8") as f:
+        with open(str(self.log_path), "a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
 
 # Example Entry for a Bypass:

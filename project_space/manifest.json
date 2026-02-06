@@ -1,40 +1,54 @@
 {
-  "project_id": "validation-test-2026",
-  "target_file": "test_model.xlsx",
-  "stability_threshold": 0.15,
-  "overlap_integral_cutoff": 0.05,
+  "_comment": "DRE Guardian v1.0 - Production Template Manifest",
+  "_description": "This manifest defines the epistemic contract between stakeholders and the governance engine. Each assertion binds a human anchor (owner_role) to a quantified uncertainty (PERT distribution).",
+  
+  "project_id": "dre-guardian-template",
+  "project_name": "Strategic Model - Production Template",
+  "target_file": "model.xlsx",
+  
+  "governance_config": {
+    "stability_threshold": 0.15,
+    "overlap_integral_cutoff": 0.05,
+    "freshness_sla_enforcement": true
+  },
+  
   "assertions": [
     {
-      "id": "ast-001",
-      "logical_name": "raw_material_cost",
-      "owner_role": "Director of Supply Chain",
-      "last_updated": "2026-01-26T09:00:00Z",
-      "sla_days": 15,
-      "binding": {
-        "cell": "B5"
-      },
-      "baseline_value": 450.0,
-      "distribution": {
-        "min": 420.0,
-        "mode": 450.0,
-        "max": 600.0
-      }
-    },
-    {
-      "id": "ast-002",
-      "logical_name": "market_capture_rate",
+      "id": "ast-sample-001",
+      "logical_name": "quarterly_revenue_forecast",
+      "description": "Q1 2026 revenue projection with market uncertainty",
       "owner_role": "VP of Sales",
-      "last_updated": "2026-01-26T14:30:00Z",
+      "last_updated": "2026-01-15T10:00:00Z",
       "sla_days": 7,
+      
       "binding": {
-        "cell": "C10"
+        "cell": "B5",
+        "sheet": "Dashboard"
       },
-      "baseline_value": 0.12,
+      
+      "baseline_value": 1000000.0,
+      
       "distribution": {
-        "min": 0.05,
-        "mode": 0.12,
-        "max": 0.15
+        "min": 850000.0,
+        "mode": 1000000.0,
+        "max": 1200000.0,
+        "_interpretation": "Optimistic scenario (max) reflects 20% upside from new customer acquisition. Pessimistic (min) accounts for 15% downside from delayed contracts."
+      },
+      
+      "_gates_tested": {
+        "freshness": "last_updated must be within sla_days of current date",
+        "stability": "baseline_value must remain within [min, max] range",
+        "alignment": "current Excel value must overlap with PERT distribution (overlap > 5%)",
+        "structure": "cell B5 must exist and contain numeric data"
       }
     }
-  ]
+  ],
+  
+  "_usage_instructions": {
+    "1_customize": "Edit project_id, project_name, and target_file to match your Excel model",
+    "2_add_assertions": "Add assertions for each critical input in your strategic model",
+    "3_set_sla": "Configure sla_days based on your team's update frequency",
+    "4_run_check": "Execute: dre check --manifest project_space/manifest.json",
+    "5_monitor": "Start live monitoring: dre monitor --dashboard"
+  }
 }

@@ -16,7 +16,7 @@ export default function GovernanceVelocity({ recentHours = 24 }: VelocityProps) 
 
   const fetchAuditData = useCallback(async () => {
     try {
-      const response = await fetch('http://localhost:8000/api/audit/recent?limit=100')
+      const response = await fetch('/api/audit/recent?limit=100')
       if (response.ok) {
         const data = await response.json()
         console.log('📊 GovernanceVelocity: Fetched audit data', data)
